@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DroqsDB - Overseas Shop Auto Reporter (Desktop + TornPDA)
 // @namespace    https://droqsdb.com/
-// @version      1.3.2
-// @description  Collects overseas shop prices/stock and submits them to DroqsDB. Quiet UI; supports Desktop Torn + TornPDA (cart icon). SPA-safe.
+// @version      1.3.3
+// @description  Collects overseas shop prices/stock and submits them to DroqsDB. Quiet UI; supports Desktop Torn + TornPDA. SPA-safe. Forces category/shop so site grouping stays correct.
 // @author       Droq
 // @match        https://www.torn.com/*
 // @run-at       document-idle
@@ -18,14 +18,11 @@
   const API_URL = "https://droqsdb.com/api/report-stock";
   const MAX_ITEMS = 300;
 
-  // UI
   const AUTO_HIDE_MS = 2500;
   const FAILSAFE_HIDE_MS = 7000;
 
-  // Avoid spam uploads
   const UPLOAD_COOLDOWN_MS = 60 * 1000;
 
-  // Locations (must match server)
   const COUNTRY_NAMES = [
     "Mexico",
     "Cayman Islands",
@@ -49,7 +46,7 @@
     ["south africa", "South Africa"],
   ]);
 
-  // ---------- Badge (hidden by default) ----------
+  // ---------- Badge ----------
   const badge = document.createElement("div");
   badge.style.cssText = `
     position: fixed;
@@ -111,7 +108,6 @@
   function normalizeCountryCandidate(s) {
     const t = norm(s).toLowerCase();
     if (!t) return null;
-
     for (const name of COUNTRY_NAMES) {
       if (t === name.toLowerCase()) return name;
     }
@@ -181,21 +177,19 @@
     return null;
   }
 
-  // ---------- Desktop collector (BUY buttons) ----------
-  function getBuyButtonsDesktop() {
-    const btns = [...document.querySelectorAll("button, input, a, div[role='button']")];
-    return btns.filter((el) => {
-      const t = norm(el.textContent || el.value);
-      return t && t.toLowerCase() === "buy";
-    });
+  function shopToCategory(shop) {
+    const s = (shop || "").toLowerCase();
+    if (s.includes("general")) return "General";
+    if (s.includes("arms")) return "Arms Dealer";
+    if (s.includes("black")) return "Black Market";
+    return "Uncategorized";
   }
 
   function findNearestShopLabel(startEl) {
     let el = startEl;
-    for (let i = 0; i < 10 && el; i++) {
-      const headings = el.querySelectorAll(
-        "h1,h2,h3,h4,[role='heading'],div[class*='title'],div[class*='header'],span[class*='title']"
-      );
+    for (let i = 0; i < 14 && el; i++) {
+      // Look for headings within/near this subtree
+      const headings = el.querySelectorAll("h1,h2,h3,h4,[role='heading'],div,span");
       for (const h of headings) {
         const shop = normalizeShopName(h.textContent);
         if (shop) return shop;
@@ -205,30 +199,41 @@
     return null;
   }
 
+  // ---------- Desktop collector ----------
+  function getBuyButtonsDesktop() {
+    const btns = [...document.querySelectorAll("button, input, a, div[role='button']")];
+    return btns.filter((el) => norm(el.textContent || el.value).toLowerCase() === "buy");
+  }
+
   function parseFromTableRowDesktop(buyEl) {
     const tr = buyEl.closest("tr");
     if (!tr) return null;
 
     const tds = [...tr.querySelectorAll("td")];
-    // old desktop layout often: [icon][name][...][cost][stock][buy]
     if (tds.length < 4) return null;
 
     const name = norm(tds[1]?.textContent);
-    const cost = parseMoney(norm(tds[3]?.textContent));
-    const stock = parseIntFromText(norm(tds[4]?.textContent || tr.textContent));
+    // Desktop columns can move; detect cost by $ and stock by integer from right side
+    const rowText = norm(tr.textContent);
+    const cost = parseMoney(rowText);
+    // stock is often near "Stock" column; best effort: pick the largest int in row that isn't cost
+    const stock = parseIntFromText(rowText);
 
     if (!name || cost == null || stock == null) return null;
+
     const shop = findNearestShopLabel(tr) || "Uncategorized";
-    return { name, cost, stock, shop };
+    const category = shopToCategory(shop);
+
+    return { name, cost, stock, shop, category };
   }
 
   function findRowContainerFromBuy(buyEl) {
     let el = buyEl;
-    for (let i = 0; i < 14 && el; i++) {
+    for (let i = 0; i < 16 && el; i++) {
       el = el.parentElement;
       if (!el) break;
       const t = norm(el.innerText);
-      if (t.length < 1200 && t.includes("$") && /[0-9]/.test(t)) return el;
+      if (t.length < 1500 && t.includes("$") && /[0-9]/.test(t)) return el;
     }
     return null;
   }
@@ -240,26 +245,28 @@
       rowEl.querySelector("a[class*='item']");
 
     const name = nameEl ? norm(nameEl.textContent) : null;
+    const text = norm(rowEl.innerText);
 
-    const priceEl = rowEl.querySelector("span[class*='displayPrice'], [class*='price'], [class*='cost']");
-    const cost = priceEl ? parseMoney(norm(priceEl.textContent)) : parseMoney(norm(rowEl.innerText));
+    const cost = parseMoney(text);
 
+    // try stock labeled first
     let stock = null;
-    const stockEl = rowEl.querySelector("[data-tt-content-type='stock'], [class*='stock']");
-    if (stockEl) stock = parseIntFromText(norm(stockEl.textContent));
-    if (stock == null) {
-      const labeled = norm(rowEl.innerText).match(/\bStock\b[^0-9]*([0-9][0-9,]*)/i);
-      if (labeled) stock = parseIntFromText(labeled[1]);
-    }
+    const labeled = text.match(/\bStock\b[^0-9]*([0-9][0-9,]*)/i);
+    if (labeled) stock = parseIntFromText(labeled[1]);
+    if (stock == null) stock = parseIntFromText(text);
 
     if (!name || cost == null || stock == null) return null;
+
     const shop = findNearestShopLabel(rowEl) || "Uncategorized";
-    return { name, cost, stock, shop };
+    const category = shopToCategory(shop);
+
+    return { name, cost, stock, shop, category };
   }
 
   function collectItemsDesktop() {
     const out = new Map();
-    for (const buy of getBuyButtonsDesktop()) {
+    const buys = getBuyButtonsDesktop();
+    for (const buy of buys) {
       let item = parseFromTableRowDesktop(buy);
       if (!item) {
         const row = findRowContainerFromBuy(buy);
@@ -270,75 +277,69 @@
     return [...out.values()];
   }
 
-  // ---------- TornPDA collector (tables with cart icons) ----------
-  function isOverseasShopTable(table) {
-    const t = norm(table.innerText).toLowerCase();
-    return t.includes("name") && t.includes("stock") && t.includes("cost") && t.includes("buy");
-  }
-
-  function getOverseasTables() {
-    return [...document.querySelectorAll("table")].filter(isOverseasShopTable);
-  }
-
-  function findShopLabelForTable(tableEl) {
-    let el = tableEl;
-    for (let up = 0; up < 12 && el; up++) {
-      let sib = el;
-      for (let back = 0; back < 12 && sib; back++) {
-        sib = sib.previousElementSibling;
-        if (!sib) break;
-        const shop = normalizeShopName(sib.textContent);
-        if (shop) return shop;
-        const hs = sib.querySelectorAll("h1,h2,h3,h4,[role='heading']");
-        for (const h of hs) {
-          const s = normalizeShopName(h.textContent);
-          if (s) return s;
-        }
-      }
-      el = el.parentElement;
-    }
-    return null;
+  // ---------- TornPDA collector ----------
+  function looksLikeShopRow(tr) {
+    const t = norm(tr.innerText);
+    // needs a $ cost and at least one number (stock)
+    return t.includes("$") && /[0-9]/.test(t);
   }
 
   function collectItemsTornPDA() {
+    // TornPDA: easiest reliable approach is parse ALL visible shop rows inside tables
     const items = [];
     const seen = new Set();
 
-    const tables = getOverseasTables();
+    const tables = [...document.querySelectorAll("table")];
     for (const table of tables) {
-      const shop = findShopLabelForTable(table) || "Uncategorized";
-      const rows = [...table.querySelectorAll("tr")];
+      const rows = [...table.querySelectorAll("tr")].filter(looksLikeShopRow);
+      if (rows.length < 3) continue; // avoid random tables
+
+      const shop = findNearestShopLabel(table) || "Uncategorized";
+      const category = shopToCategory(shop);
 
       for (const tr of rows) {
         const tds = [...tr.querySelectorAll("td")];
-        // expected columns: Item | Name | Stock | Cost | Buy
-        if (tds.length < 4) continue;
+        if (tds.length < 3) continue;
 
+        // In your TornPDA screenshot: [Item icon] [Name] [Stock] [Cost] [Cart]
         const name = norm(tds[1]?.textContent);
-        if (!name) continue;
-
         const stock = parseIntFromText(norm(tds[2]?.textContent));
-        const cost = parseMoney(norm(tds[3]?.textContent));
-        if (stock == null || cost == null) continue;
+        const cost = parseMoney(norm(tds[3]?.textContent || tr.textContent));
+
+        if (!name || stock == null || cost == null) continue;
 
         const key = name.toLowerCase();
         if (seen.has(key)) continue;
         seen.add(key);
 
-        items.push({ name, stock, cost, shop });
+        items.push({ name, stock, cost, shop, category });
       }
     }
+
     return items;
   }
 
   // ---------- Submit ----------
   function submit(country, items) {
+    // Ensure we always send shop+category
+    const payloadItems = items.map((it) => {
+      const shop = it.shop || "Uncategorized";
+      const category = it.category || shopToCategory(shop);
+      return {
+        name: it.name,
+        stock: it.stock,
+        cost: it.cost,
+        shop,
+        category,
+      };
+    });
+
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: "POST",
         url: API_URL,
         headers: { "Content-Type": "application/json" },
-        data: JSON.stringify({ country, items: items.slice(0, MAX_ITEMS) }),
+        data: JSON.stringify({ country, items: payloadItems.slice(0, MAX_ITEMS) }),
         onload: (res) => (res.status >= 200 && res.status < 300 ? resolve() : reject(`HTTP ${res.status}`)),
         onerror: () => reject("Network error"),
       });
@@ -364,35 +365,34 @@
     } catch {}
   }
 
-  // ---------- Run once when shop appears ----------
-  let hasRun = false;
+  // ---------- Run when shop appears (SPA-safe) ----------
+  let running = false;
 
   async function tryRun() {
-    if (hasRun) return;
+    if (running) return;
 
-    // Detect which UI we’re on
-    const hasTornPDA = getOverseasTables().length > 0;
     const hasDesktop = getBuyButtonsDesktop().length > 0;
+    // TornPDA: instead of strict header matching, just see if we can parse any items
+    const pdaPreview = collectItemsTornPDA();
+    const hasPDA = pdaPreview.length > 0;
 
-    // Only proceed if we see a shop UI
-    if (!hasTornPDA && !hasDesktop) return;
+    if (!hasDesktop && !hasPDA) return;
 
-    // country
     let country = detectCountry();
     if (!country) country = askCountryOverride();
     if (!country) return;
 
     if (recentlyUploaded(country)) return;
 
-    hasRun = true; // lock to prevent repeated uploads on SPA refreshes
+    running = true;
     showBadge("DroqsDB: scanning…");
 
-    const items = hasTornPDA ? collectItemsTornPDA() : collectItemsDesktop();
+    const items = hasPDA ? pdaPreview : collectItemsDesktop();
 
     if (!items.length) {
       showBadge(`DroqsDB: no items found\n${country}`);
       hideBadge(AUTO_HIDE_MS);
-      hasRun = false; // allow retry if UI finishes loading
+      running = false;
       return;
     }
 
@@ -413,17 +413,12 @@
     } catch (e) {
       showBadge(`DroqsDB: upload failed ✗\n${country}\n${String(e)}`);
       hideBadge(AUTO_HIDE_MS);
-      hasRun = false; // allow retry after failure
+      running = false;
     }
   }
 
-  // Initial attempt + SPA-safe observer
+  // initial + observer
   tryRun();
-
-  const obs = new MutationObserver(() => {
-    // If shop UI appears later via AJAX, this will catch it
-    tryRun();
-  });
+  const obs = new MutationObserver(() => tryRun());
   obs.observe(document.documentElement, { childList: true, subtree: true });
-
 })();
