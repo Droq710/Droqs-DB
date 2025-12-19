@@ -1,11 +1,10 @@
 // ==UserScript==
 // @name         DroqsDB Overseas Stock Reporter
 // @namespace    https://droqsdb.com/
-// @version      1.3.4
+// @version      1.3.5
 // @description  Collects overseas shop stock+prices and uploads to droqsdb.com
 // @author       Droq
 // @match        https://www.torn.com/page.php?sid=travel*
-// @match        https://www.torn.com/page.php?sid=travel
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      droqsdb.com
@@ -18,7 +17,23 @@
 
   const API_URL = "https://droqsdb.com/api/report-stock";
 
-  // ---- UI badge (only visible during work) ----
+  const KNOWN_COUNTRIES = new Set([
+    "Mexico",
+    "Cayman Islands",
+    "Canada",
+    "Hawaii",
+    "United Kingdom",
+    "Argentina",
+    "Switzerland",
+    "Japan",
+    "China",
+    "UAE",
+    "South Africa",
+  ]);
+
+  const SHOP_NAMES = ["General Store", "Arms Dealer", "Black Market"];
+
+  // ---------------- Badge ----------------
   let badgeEl = null;
   let hideTimer = null;
 
@@ -34,13 +49,14 @@
     badgeEl.style.borderRadius = "10px";
     badgeEl.style.fontSize = "12px";
     badgeEl.style.fontFamily = "Arial, sans-serif";
+    badgeEl.style.whiteSpace = "pre-line";
     badgeEl.style.boxShadow = "0 8px 20px rgba(0,0,0,0.35)";
     badgeEl.style.background = "rgba(0,0,0,0.85)";
     badgeEl.style.color = "#fff";
     badgeEl.style.display = "none";
     badgeEl.textContent = "DroqsDB: idle";
 
-    document.body.appendChild(badgeEl);
+    (document.body || document.documentElement).appendChild(badgeEl);
     return badgeEl;
   }
 
@@ -59,211 +75,226 @@
     }, ms);
   }
 
-  // ---- Utilities ----
+  // ---------------- Utils ----------------
   function normText(s) {
     return String(s || "").replace(/\s+/g, " ").trim();
   }
 
-  function parseMoney(s) {
-    const t = normText(s).replace(/[$,]/g, "");
-    const n = Number(t);
+  function parseMoneyFromText(text) {
+    const t = normText(text);
+    // matches: $1,234 or $1234
+    const m = t.match(/\$[\s]*([\d,]+)/);
+    if (!m) return null;
+    const n = Number(String(m[1]).replace(/,/g, ""));
     return Number.isFinite(n) ? n : null;
   }
 
-  function parseIntSafe(s) {
-    const t = normText(s).replace(/[,]/g, "");
-    const n = Number(t);
-    return Number.isFinite(n) ? Math.trunc(n) : null;
+  function parseStockFromText(text) {
+    const t = normText(text).toLowerCase();
+
+    // common patterns like: "Stock: 12", "12 in stock", "12 Stock"
+    const m1 = t.match(/stock[:\s]*([\d,]+)/i);
+    if (m1) {
+      const n = Number(String(m1[1]).replace(/,/g, ""));
+      return Number.isFinite(n) ? Math.trunc(n) : null;
+    }
+
+    const m2 = t.match(/([\d,]+)\s*in\s*stock/i);
+    if (m2) {
+      const n = Number(String(m2[1]).replace(/,/g, ""));
+      return Number.isFinite(n) ? Math.trunc(n) : null;
+    }
+
+    // fallback: pick a reasonable integer present in text
+    const nums = Array.from(t.matchAll(/\b(\d{1,3}(?:,\d{3})*)\b/g)).map((x) =>
+      Number(String(x[1]).replace(/,/g, ""))
+    );
+    const candidates = nums.filter((n) => Number.isFinite(n) && n >= 0 && n <= 100000);
+    if (!candidates.length) return null;
+
+    // choose the largest as stock tends to be larger than random labels
+    return Math.trunc(Math.max(...candidates));
   }
 
-  // ---- Country detection ----
+  function looksLikeRow(el) {
+    if (!el) return false;
+    const text = normText(el.innerText || el.textContent || "");
+    if (!text) return false;
+    if (!text.includes("$")) return false; // must have price
+    return true;
+  }
+
+  function pickNameFromRowText(text) {
+    const t = normText(text);
+    if (!t) return null;
+
+    // remove obvious labels
+    const cleaned = t
+      .replace(/\bBUY\b/gi, " ")
+      .replace(/\bStock\b/gi, " ")
+      .replace(/\bIn Stock\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    // take text before first $ if possible
+    const beforeDollar = cleaned.split("$")[0].trim();
+    if (beforeDollar && beforeDollar.length >= 2 && beforeDollar.length <= 60) {
+      // Often "Item Name 123" could appear, strip trailing numbers
+      return beforeDollar.replace(/\s+\d+$/g, "").trim();
+    }
+
+    // fallback: first "line-ish" token
+    const parts = cleaned.split(" ").filter(Boolean);
+    if (!parts.length) return null;
+    const guess = parts.slice(0, 6).join(" ").trim();
+    return guess.length >= 2 ? guess : null;
+  }
+
+  function categoryForShop(shop) {
+    if (SHOP_NAMES.includes(shop)) return shop;
+    return "Uncategorized";
+  }
+
+  // ---------------- Country detection ----------------
   function getCountryName() {
-    // Desktop + TornPDA typically have a main heading with the country name
-    // Common patterns: "Mexico" appears in h1/h2, or in the travel location header.
-    const candidates = [];
+    // First: exact matches from common headings
+    const headingCandidates = [];
 
     const h1 = document.querySelector("h1");
-    if (h1) candidates.push(normText(h1.textContent));
+    if (h1) headingCandidates.push(normText(h1.textContent));
 
     const h2 = document.querySelector("h2");
-    if (h2) candidates.push(normText(h2.textContent));
+    if (h2) headingCandidates.push(normText(h2.textContent));
 
-    // Torn classic travel page: left/top header includes country as plain text in a container
     const titleLike = document.querySelector(".title, .header, .travel-title, .content-title");
-    if (titleLike) candidates.push(normText(titleLike.textContent));
+    if (titleLike) headingCandidates.push(normText(titleLike.textContent));
 
-    // As fallback, look for a single large breadcrumb/title near the top of content
-    const anyBig = Array.from(document.querySelectorAll("div, span"))
-      .slice(0, 80)
+    for (const c of headingCandidates) {
+      if (KNOWN_COUNTRIES.has(c)) return c;
+    }
+
+    // Broader scan near top of page
+    const topText = Array.from(document.querySelectorAll("h1,h2,h3,div,span"))
+      .slice(0, 120)
       .map((el) => normText(el.textContent))
       .filter(Boolean);
 
-    for (const c of candidates) {
-      if (KNOWN_COUNTRIES.has(c)) return c;
-    }
-    for (const t of anyBig) {
+    for (const t of topText) {
       if (KNOWN_COUNTRIES.has(t)) return t;
     }
 
     return null;
   }
 
-  const KNOWN_COUNTRIES = new Set([
-    "Mexico",
-    "Cayman Islands",
-    "Canada",
-    "Hawaii",
-    "United Kingdom",
-    "Argentina",
-    "Switzerland",
-    "Japan",
-    "China",
-    "UAE",
-    "South Africa",
-  ]);
+  // ---------------- Shop section detection ----------------
+  function findShopAnchors() {
+    // Find elements whose text includes each shop name.
+    const all = Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,div,span,button,a"));
+    const anchors = [];
 
-  // ---- Shop table extraction ----
-  const SHOP_NAMES = ["General Store", "Arms Dealer", "Black Market"];
+    for (const shop of SHOP_NAMES) {
+      const shopLower = shop.toLowerCase();
+      const el = all.find((n) => normText(n.textContent).toLowerCase() === shopLower)
+        || all.find((n) => normText(n.textContent).toLowerCase().includes(shopLower));
 
-  function findShopSections() {
-    // Approach:
-    // Find headers that match shop names. For each header, find the next <table> after it.
-    const sections = [];
-
-    // Gather likely header nodes
-    const textNodes = Array.from(document.querySelectorAll("div, h3, h4, h5, span"))
-      .filter((el) => el.children.length === 0) // leaf-ish
-      .map((el) => ({ el, text: normText(el.textContent) }))
-      .filter((x) => SHOP_NAMES.includes(x.text));
-
-    for (const { el, text } of textNodes) {
-      // find next table after header
-      let cur = el;
-      let table = null;
-
-      // walk forward in DOM siblings / parent siblings
-      for (let i = 0; i < 20 && cur; i++) {
-        if (cur.nextElementSibling) {
-          cur = cur.nextElementSibling;
-        } else {
-          cur = cur.parentElement;
-          continue;
-        }
-
-        if (!cur) break;
-        if (cur.tagName === "TABLE") {
-          table = cur;
-          break;
-        }
-        const t = cur.querySelector && cur.querySelector("table");
-        if (t) {
-          table = t;
-          break;
-        }
-      }
-
-      if (table) sections.push({ shop: text, table });
+      if (el) anchors.push({ shop, el });
     }
 
-    // De-dupe by table reference
-    const seen = new Set();
-    return sections.filter((s) => {
-      if (seen.has(s.table)) return false;
-      seen.add(s.table);
-      return true;
+    return anchors;
+  }
+
+  function nearestSectionRoot(el) {
+    // Walk up to a container that likely holds the list of items for that shop
+    let cur = el;
+    for (let i = 0; i < 10 && cur; i++) {
+      const parent = cur.parentElement;
+      if (!parent) break;
+
+      // if parent contains multiple "$" occurrences, it's likely the whole section
+      const txt = normText(parent.innerText || parent.textContent || "");
+      const dollarCount = (txt.match(/\$/g) || []).length;
+
+      if (dollarCount >= 2) return parent;
+      cur = parent;
+    }
+    return el.parentElement || el;
+  }
+
+  function collectRowsFromRoot(root) {
+    if (!root) return [];
+
+    // Preferred: table rows if they exist
+    const trs = Array.from(root.querySelectorAll("tr")).filter(looksLikeRow);
+    if (trs.length) return trs;
+
+    // Otherwise: common row containers
+    const candidates = Array.from(root.querySelectorAll("li, .row, .item, .item-row, .content, div"))
+      .filter((el) => {
+        // avoid gigantic container divs
+        if (el.querySelectorAll("div,span,a,button,li,tr").length > 120) return false;
+        return looksLikeRow(el);
+      });
+
+    // Keep only those that look like a single item (has a Buy button OR not too long)
+    return candidates.filter((el) => {
+      const t = normText(el.innerText || el.textContent || "");
+      const buyish = /buy/i.test(t) || !!el.querySelector("button, a");
+      return buyish || t.length < 220;
     });
   }
 
-  function parseTableRows(shop, table) {
-    const out = [];
-    const rows = Array.from(table.querySelectorAll("tr"));
-    for (const tr of rows) {
-      const tds = Array.from(tr.querySelectorAll("td"));
-      if (tds.length < 4) continue;
+  function parseRow(shop, rowEl) {
+    const text = normText(rowEl.innerText || rowEl.textContent || "");
+    if (!text || !text.includes("$")) return null;
 
-      // Torn travel tables generally: [icon] [name] [type] [cost] [stock] ...
-      // TornPDA table: [icon] [name] [stock] [cost] [buy]
-      const cellTexts = tds.map((td) => normText(td.textContent));
+    const cost = parseMoneyFromText(text);
+    const stock = parseStockFromText(text);
+    const name = pickNameFromRowText(text);
 
-      // Detect name/stock/cost by heuristics
-      let name = null;
-      let cost = null;
-      let stock = null;
+    if (!name || cost === null || stock === null) return null;
 
-      // If there's a money-looking cell, that's cost
-      for (const txt of cellTexts) {
-        if (txt.includes("$")) {
-          const m = parseMoney(txt);
-          if (m !== null) {
-            cost = m;
-            break;
-          }
-        }
-      }
-
-      // Stock is usually a plain number cell (often near cost)
-      // Pick the largest-ish integer cell that isn't the cost
-      const nums = cellTexts
-        .map((t) => parseIntSafe(t))
-        .filter((n) => n !== null && n >= 0);
-
-      // Name: first non-empty text that isn't purely numeric and isn't "BUY"
-      for (const txt of cellTexts) {
-        if (!txt) continue;
-        if (txt.toUpperCase() === "BUY") continue;
-        if (/^\$[\d,]+$/.test(txt)) continue;
-        if (/^[\d,]+$/.test(txt)) continue;
-        if (txt.length < 2) continue;
-        name = txt;
-        break;
-      }
-
-      // Stock heuristic: choose a number cell that isn't cost and isn't tiny like "0/29"
-      if (nums.length) {
-        // If TornPDA, stock is often one of the earliest numeric cells
-        stock = nums[0];
-        // But if nums[0] is suspiciously small and there are other candidates, choose max
-        if (nums.length > 1 && stock !== null && stock <= 5) {
-          stock = Math.max(...nums);
-        }
-      }
-
-      if (!name || cost === null || stock === null) continue;
-
-      out.push({
-        name,
-        stock,
-        cost,
-        shop,
-      });
-    }
-    return out;
+    return {
+      name,
+      stock,
+      cost,
+      shop,
+      category: categoryForShop(shop),
+    };
   }
 
   function collectAllItems() {
-    const sections = findShopSections();
+    const anchors = findShopAnchors();
 
-    // If headers aren't found (some layouts), fallback: find ANY tables inside main content
-    if (!sections.length) {
-      const tables = Array.from(document.querySelectorAll("table"));
-      // best effort: treat as unknown shop
-      const items = [];
-      for (const t of tables) items.push(...parseTableRows("General Store", t));
-      return items;
+    // If we can't find shop anchors, we are probably not on the shop view
+    if (!anchors.length) return [];
+
+    const allItems = [];
+    const seen = new Set();
+
+    for (const { shop, el } of anchors) {
+      const root = nearestSectionRoot(el);
+      const rows = collectRowsFromRoot(root);
+
+      for (const row of rows) {
+        const parsed = parseRow(shop, row);
+        if (!parsed) continue;
+
+        const key = `${parsed.shop}::${parsed.name}`.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        allItems.push(parsed);
+      }
     }
 
-    const items = [];
-    for (const s of sections) {
-      items.push(...parseTableRows(s.shop, s.table));
-    }
-    return items;
+    return allItems;
   }
 
-  // ---- Upload (GM_xmlhttpRequest preferred, fetch fallback for TornPDA) ----
+  // ---------------- Upload ----------------
   async function uploadReport(country, items) {
     const payload = JSON.stringify({ country, items });
 
-    // GM_xmlhttpRequest path
+    // Prefer GM_xmlhttpRequest (bypasses page CSP, best for Torn + TornPDA)
     if (typeof GM_xmlhttpRequest === "function") {
       return await new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
@@ -282,58 +313,75 @@
       });
     }
 
-    // fetch fallback (works better in TornPDA / webviews)
+    // Fallback (may be blocked by CSP in some environments)
     const res = await fetch(API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: payload,
+      mode: "cors",
+      credentials: "omit",
     });
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return true;
   }
 
-  // ---- Run logic ----
+  // ---------------- Run loop ----------------
   let lastSignature = null;
+
   async function tryScanAndUpload() {
-    const url = location.href;
-    if (!url.includes("page.php?sid=travel")) return;
+    if (!location.href.includes("page.php?sid=travel")) return;
+
+    showBadge("DroqsDB: loaded\nScanning…");
 
     const country = getCountryName();
-    if (!country) return;
+    if (!country) {
+      showBadge("DroqsDB: scanning…\nCountry not detected");
+      hideBadgeSoon(2000);
+      return;
+    }
 
     const items = collectAllItems();
+
     if (!items.length) {
-      showBadge(`DroqsDB: ${country}\nNo items found`);
+      showBadge(`DroqsDB: ${country}\nNo shop items detected`);
       hideBadgeSoon(2500);
       return;
     }
 
-    // Prevent spam uploads: compute a signature based on names+cost+stock+shop
-    const sig = country + "::" + items.map((i) => `${i.shop}|${i.name}|${i.stock}|${i.cost}`).join(";");
-    if (sig === lastSignature) return;
+    // signature: prevents spam uploads
+    const sig =
+      country +
+      "::" +
+      items
+        .map((i) => `${i.shop}|${i.name}|${i.stock}|${i.cost}`)
+        .join(";");
+
+    if (sig === lastSignature) {
+      showBadge(`DroqsDB: ${country}\nNo changes detected`);
+      hideBadgeSoon(1500);
+      return;
+    }
     lastSignature = sig;
 
-    showBadge(`DroqsDB: scanning...\n${country}\nItems: ${items.length}`);
+    showBadge(`DroqsDB: ${country}\nUploading…\nItems: ${items.length}`);
 
     try {
-      showBadge(`DroqsDB: uploading...\n${country}\nItems: ${items.length}`);
       await uploadReport(country, items);
-      showBadge(`DroqsDB: uploaded ✓\n${country}\nItems: ${items.length}`);
+      showBadge(`DroqsDB: ${country}\nUploaded ✓\nItems: ${items.length}`);
       hideBadgeSoon(2000);
     } catch (e) {
-      showBadge(`DroqsDB: upload failed\n${country}\n${String(e.message || e)}`);
+      showBadge(`DroqsDB: ${country}\nUpload failed\n${String(e.message || e)}`);
       hideBadgeSoon(3500);
     }
   }
 
-  // Initial attempt + observe DOM changes (travel page loads content dynamically)
+  // Initial run + MutationObserver (page updates dynamically)
   tryScanAndUpload();
 
   const obs = new MutationObserver(() => {
-    // debounce-ish: let DOM settle
     if (window.__droqsdb_scan_timer) clearTimeout(window.__droqsdb_scan_timer);
-    window.__droqsdb_scan_timer = setTimeout(tryScanAndUpload, 350);
+    window.__droqsdb_scan_timer = setTimeout(tryScanAndUpload, 500);
   });
 
   obs.observe(document.documentElement, { childList: true, subtree: true });
