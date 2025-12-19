@@ -2,12 +2,13 @@
 // @name         Droqs DB - Overseas Shop Auto Reporter
 // @namespace    https://droqsdb.com/
 // @version      1.2.0
-// @description  Automatically collects overseas shop prices/stock and submits them to Droqs DB (with auto-categorization).
+// @description  Automatically collects overseas shop prices and stock for Droqs DB
 // @author       Droq
 // @match        https://www.torn.com/*
-// @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      droqsdb.com
+// @downloadURL  https://raw.githubusercontent.com/Droq710/Droqs-DB/main/droqsdb-overseas.user.js
+// @updateURL    https://raw.githubusercontent.com/Droq710/Droqs-DB/main/droqsdb-overseas.user.js
 // ==/UserScript==
 
 (() => {
