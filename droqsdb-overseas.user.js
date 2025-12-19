@@ -1,14 +1,13 @@
 // ==UserScript==
-// @name         Droqs DB - Overseas Shop Auto Reporter
+// @name         DroqsDB - Overseas Shop Auto Reporter (Torn + TornPDA)
 // @namespace    https://droqsdb.com/
-// @version      1.2.0
-// @description  Automatically collects overseas shop prices and stock for Droqs DB
+// @version      1.3.1
+// @description  Collects overseas shop prices/stock and submits them to DroqsDB. Quiet UI; TornPDA table/cart-icon support.
 // @author       Droq
 // @match        https://www.torn.com/*
+// @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      droqsdb.com
-// @downloadURL  https://raw.githubusercontent.com/Droq710/Droqs-DB/main/droqsdb-overseas.user.js
-// @updateURL    https://raw.githubusercontent.com/Droq710/Droqs-DB/main/droqsdb-overseas.user.js
 // ==/UserScript==
 
 (() => {
@@ -17,7 +16,39 @@
   const API_URL = "https://droqsdb.com/api/report-stock";
   const MAX_ITEMS = 300;
 
-  // ---------- UI BADGE ----------
+  // Badge behavior
+  const AUTO_HIDE_MS = 2500;
+  const FAILSAFE_HIDE_MS = 7000;
+
+  // Prevent spam uploads when navigating around overseas pages
+  const UPLOAD_COOLDOWN_MS = 60 * 1000;
+
+  // --------- Known overseas locations (must match server) ----------
+  const COUNTRY_NAMES = [
+    "Mexico",
+    "Cayman Islands",
+    "Canada",
+    "Hawaii",
+    "United Kingdom",
+    "Argentina",
+    "Switzerland",
+    "Japan",
+    "China",
+    "UAE",
+    "South Africa",
+  ];
+
+  const COUNTRY_ALIASES = new Map([
+    ["united arab emirates", "UAE"],
+    ["uae", "UAE"],
+    ["uk", "United Kingdom"],
+    ["united kingdom", "United Kingdom"],
+    ["cayman", "Cayman Islands"],
+    ["cayman islands", "Cayman Islands"],
+    ["south africa", "South Africa"],
+  ]);
+
+  // ---------- UI BADGE (CREATED ONCE, HIDDEN BY DEFAULT) ----------
   const badge = document.createElement("div");
   badge.style.cssText = `
     position: fixed;
@@ -32,9 +63,40 @@
     font: 12px/1.3 system-ui, sans-serif;
     white-space: pre-line;
     max-width: 420px;
+    display: none;
   `;
   document.documentElement.appendChild(badge);
-  const setBadge = (t) => (badge.textContent = t);
+
+  let hideTimer = null;
+  let failsafeTimer = null;
+
+  function showBadge(text) {
+    if (hideTimer) clearTimeout(hideTimer);
+    if (failsafeTimer) clearTimeout(failsafeTimer);
+
+    badge.textContent = text;
+    badge.style.display = "block";
+
+    // failsafe: badge can never stay forever
+    failsafeTimer = setTimeout(() => {
+      badge.style.display = "none";
+    }, FAILSAFE_HIDE_MS);
+  }
+
+  function hideBadge(afterMs = 0) {
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => {
+      badge.style.display = "none";
+      if (failsafeTimer) clearTimeout(failsafeTimer);
+      failsafeTimer = null;
+    }, Math.max(0, afterMs));
+  }
+
+  // extra safety on SPA-ish transitions
+  window.addEventListener("pagehide", () => (badge.style.display = "none"));
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) badge.style.display = "none";
+  });
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
@@ -54,59 +116,97 @@
   }
 
   // ---------- COUNTRY DETECTION ----------
-  function detectCountry() {
-    // Confirmed element:
-    const h = document.querySelector("h4[class*='title___']");
-    if (h) return norm(h.textContent);
+  function normalizeCountryCandidate(s) {
+    const t = norm(s).toLowerCase();
+    if (!t) return null;
 
-    const txt = document.body?.innerText || "";
-    const m = txt.match(/You are in\s+([A-Za-z\s]+?)\s+and have\s+\$/i);
-    if (m) return norm(m[1]);
+    for (const name of COUNTRY_NAMES) {
+      if (t === name.toLowerCase()) return name;
+    }
+    if (COUNTRY_ALIASES.has(t)) return COUNTRY_ALIASES.get(t);
+    return null;
+  }
+
+  function scanForKnownCountry(text) {
+    const t = norm(text).toLowerCase();
+    if (!t) return null;
+
+    for (const name of COUNTRY_NAMES) {
+      const n = name.toLowerCase();
+      const re = new RegExp(`\\b${n.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i");
+      if (re.test(t)) return name;
+    }
+
+    for (const [alias, canonical] of COUNTRY_ALIASES.entries()) {
+      const re = new RegExp(`\\b${alias.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i");
+      if (re.test(t)) return canonical;
+    }
 
     return null;
   }
 
-  // ---------- SHOP / CATEGORY DETECTION ----------
+  function detectCountry() {
+    try {
+      const saved = sessionStorage.getItem("droqsdb_country_override");
+      const normalized = normalizeCountryCandidate(saved);
+      if (normalized) return normalized;
+    } catch {}
+
+    const fromTitle = scanForKnownCountry(document.title || "");
+    if (fromTitle) return fromTitle;
+
+    const bodyText = document.body?.innerText || "";
+    const m = bodyText.match(/You are in\s+([A-Za-z\s]+?)(?:\s+and|\s+\$|\s+\.|\s*,|\n)/i);
+    if (m && m[1]) {
+      const candidate = normalizeCountryCandidate(m[1]);
+      if (candidate) return candidate;
+    }
+
+    const fromScan = scanForKnownCountry(bodyText);
+    if (fromScan) return fromScan;
+
+    return null;
+  }
+
+  function askCountryOverride() {
+    const options = COUNTRY_NAMES.map((c, i) => `${i + 1}) ${c}`).join("\n");
+    const input = prompt(
+      "DroqsDB: Could not detect your overseas country (TornPDA layout differs).\n\nChoose the number:\n" +
+        options +
+        "\n\n(We’ll remember for this session.)"
+    );
+    if (!input) return null;
+
+    const idx = Number(String(input).trim());
+    if (!Number.isFinite(idx) || idx < 1 || idx > COUNTRY_NAMES.length) return null;
+
+    const chosen = COUNTRY_NAMES[idx - 1];
+    try {
+      sessionStorage.setItem("droqsdb_country_override", chosen);
+    } catch {}
+    return chosen;
+  }
+
+  // ---------- SHOP / CATEGORY ----------
   function normalizeShopName(raw) {
     const t = norm(raw).toLowerCase();
     if (!t) return null;
-
     if (t.includes("general")) return "General Store";
     if (t.includes("arms")) return "Arms Dealer";
     if (t.includes("black")) return "Black Market";
-
     return null;
   }
 
-  function findNearestShopLabel(startEl) {
-    // We try a few strategies:
-    // 1) Walk up to a containing "section/card" and look for a header within it.
-    // 2) If not found, walk backwards in the DOM looking for a heading-like element.
-
-    // Strategy 1: climb and search within parent blocks
-    let el = startEl;
-    for (let i = 0; i < 10 && el; i++) {
-      // Search for headings in this block
-      const headings = el.querySelectorAll("h1,h2,h3,h4,[role='heading'],div[class*='title'],div[class*='header']");
-      for (const h of headings) {
-        const shop = normalizeShopName(h.textContent);
-        if (shop) return shop;
-      }
-
-      el = el.parentElement;
-    }
-
-    // Strategy 2: search previous siblings / earlier nodes
-    // Walk up a bit, then traverse previousElementSibling chain.
-    el = startEl;
-    for (let climb = 0; climb < 6 && el; climb++) {
+  function findShopLabelForTable(tableEl) {
+    // Look upward for a nearby heading like "General Store"
+    let el = tableEl;
+    for (let up = 0; up < 12 && el; up++) {
+      // check siblings above
       let sib = el;
-      for (let back = 0; back < 30 && sib; back++) {
+      for (let back = 0; back < 12 && sib; back++) {
         sib = sib.previousElementSibling;
         if (!sib) break;
-
-        const txt = norm(sib.textContent);
-        const shop = normalizeShopName(txt);
+        const shop = normalizeShopName(sib.textContent);
         if (shop) return shop;
 
         const hs = sib.querySelectorAll("h1,h2,h3,h4,[role='heading']");
@@ -117,89 +217,63 @@
       }
       el = el.parentElement;
     }
-
-    return null; // unknown
-  }
-
-  // ---------- FIND BUY BUTTONS ----------
-  function getBuyButtons() {
-    const btns = [...document.querySelectorAll("button, input")];
-    return btns.filter((el) => norm(el.textContent || el.value).toUpperCase() === "BUY");
-  }
-
-  // ---------- PARSE TABLE ROW (PRIMARY) ----------
-  function parseFromTableRow(buyEl) {
-    const tr = buyEl.closest("tr");
-    if (!tr) return null;
-
-    const tds = [...tr.querySelectorAll("td")];
-    // Expected: Item | Name | Type | Cost | Stock | Amount | Buy
-    if (tds.length < 6) return null;
-
-    const name = norm(tds[1]?.textContent);
-    const cost = parseMoney(norm(tds[3]?.textContent));
-    const stock = parseIntFromText(norm(tds[4]?.textContent));
-
-    if (!name || cost == null || stock == null) return null;
-
-    const shop = findNearestShopLabel(tr); // <--- NEW
-    return { name, cost, stock, shop: shop || "Uncategorized" };
-  }
-
-  // ---------- FALLBACK ROW FINDER (NON-TABLE LAYOUTS) ----------
-  function findRowContainerFromBuy(buyEl) {
-    let el = buyEl;
-    for (let i = 0; i < 12 && el; i++) {
-      el = el.parentElement;
-      if (!el) break;
-
-      const t = norm(el.innerText);
-      if (t.length < 800 && t.includes("$") && /[0-9]/.test(t)) return el;
-    }
     return null;
   }
 
-  function parseFromRowContainer(rowEl) {
-    const nameBtn = rowEl.querySelector("button[class*='itemNameButton']");
-    const name = nameBtn ? norm(nameBtn.textContent) : null;
-
-    const priceEl = rowEl.querySelector("span[class*='displayPrice']");
-    const stockEl = rowEl.querySelector("[data-tt-content-type='stock']");
-
-    const cost = priceEl ? parseMoney(norm(priceEl.textContent)) : parseMoney(norm(rowEl.innerText));
-
-    let stock = null;
-    if (stockEl) {
-      stock = parseIntFromText(norm(stockEl.textContent));
-    } else {
-      const labeled = norm(rowEl.innerText).match(/\bStock\b[^0-9]*([0-9][0-9,]*)/i);
-      if (labeled) stock = parseIntFromText(labeled[1]);
-    }
-
-    if (!name || cost == null || stock == null) return null;
-
-    const shop = findNearestShopLabel(rowEl); // <--- NEW
-    return { name, cost, stock, shop: shop || "Uncategorized" };
+  // ---------- TornPDA-friendly detection: overseas shop table ----------
+  function isOverseasShopTable(table) {
+    const headerText = norm(table.innerText).toLowerCase();
+    // Must contain these headers somewhere
+    return (
+      headerText.includes("name") &&
+      headerText.includes("stock") &&
+      headerText.includes("cost") &&
+      headerText.includes("buy")
+    );
   }
 
-  function collectItems() {
-    const map = new Map();
+  function getOverseasTables() {
+    const tables = [...document.querySelectorAll("table")];
+    return tables.filter(isOverseasShopTable);
+  }
 
-    for (const buy of getBuyButtons()) {
-      let item = parseFromTableRow(buy);
+  function collectItemsFromTables() {
+    const items = [];
+    const seen = new Set();
 
-      if (!item) {
-        const row = findRowContainerFromBuy(buy);
-        if (row) item = parseFromRowContainer(row);
+    const tables = getOverseasTables();
+    for (const table of tables) {
+      const shop = findShopLabelForTable(table) || "Uncategorized";
+
+      const rows = [...table.querySelectorAll("tr")];
+      for (const tr of rows) {
+        const tds = [...tr.querySelectorAll("td")];
+        // Expect at least: Item | Name | Stock | Cost | Buy
+        if (tds.length < 4) continue;
+
+        // Name is typically the second column in TornPDA table
+        const name = norm(tds[1]?.textContent);
+        if (!name) continue;
+
+        // Stock / Cost columns
+        // Based on your screenshot: columns are Item, Name, Stock, Cost, Buy
+        const stock = parseIntFromText(norm(tds[2]?.textContent));
+        const cost = parseMoney(norm(tds[3]?.textContent));
+
+        if (stock == null || cost == null) continue;
+
+        const key = name.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        items.push({ name, stock, cost, shop });
       }
-
-      if (item) map.set(item.name.toLowerCase(), item);
     }
 
-    return [...map.values()];
+    return items;
   }
 
-  // ---------- SUBMIT (CSP SAFE) ----------
+  // ---------- SUBMIT ----------
   function submit(country, items) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
@@ -216,43 +290,79 @@
     });
   }
 
+  // ---------- COOLDOWN (per-country) ----------
+  function cooldownKey(country) {
+    return `droqsdb_last_upload_${(country || "").toLowerCase()}`;
+  }
+
+  function recentlyUploaded(country) {
+    try {
+      const v = sessionStorage.getItem(cooldownKey(country));
+      const t = v ? Number(v) : 0;
+      return Number.isFinite(t) && Date.now() - t < UPLOAD_COOLDOWN_MS;
+    } catch {
+      return false;
+    }
+  }
+
+  function markUploaded(country) {
+    try {
+      sessionStorage.setItem(cooldownKey(country), String(Date.now()));
+    } catch {}
+  }
+
   // ---------- MAIN ----------
   async function run() {
-    setBadge("Droqs DB: scanning…");
-
-    // Wait for BUY buttons (signals shop loaded)
-    for (let i = 0; i < 20; i++) {
-      if (getBuyButtons().length) break;
-      await sleep(300);
+    // Only do anything if we can see an overseas shop table (prevents Travel page badge spam)
+    for (let i = 0; i < 16; i++) {
+      if (getOverseasTables().length) break;
+      await sleep(250);
     }
+    if (!getOverseasTables().length) return;
 
-    const country = detectCountry();
+    // Detect country
+    let country = null;
+    for (let i = 0; i < 10; i++) {
+      country = detectCountry();
+      if (country) break;
+      await sleep(200);
+    }
     if (!country) {
-      setBadge("Droqs DB: can't detect country");
-      return;
+      // Only ask if we ARE on a shop table page
+      country = askCountryOverride();
+      if (!country) return;
     }
 
-    const items = collectItems();
+    if (recentlyUploaded(country)) return;
+
+    showBadge("DroqsDB: scanning…");
+
+    const items = collectItemsFromTables();
+
     if (!items.length) {
-      setBadge(`Droqs DB: ${country}\nNo items found`);
+      showBadge(`DroqsDB: no items found\n${country}`);
+      hideBadge(AUTO_HIDE_MS);
       return;
     }
 
-    // Show a quick breakdown so you can confirm it’s categorizing
+    // simple shop breakdown for debugging
     const counts = items.reduce((acc, it) => {
       const k = it.shop || "Uncategorized";
       acc[k] = (acc[k] || 0) + 1;
       return acc;
     }, {});
-    const breakdown = Object.entries(counts).map(([k,v]) => `${k}: ${v}`).join(" | ");
+    const breakdown = Object.entries(counts).map(([k, v]) => `${k}: ${v}`).join(" | ");
 
-    setBadge(`Droqs DB: submitting ${items.length} items for ${country}…\n${breakdown}`);
+    showBadge(`DroqsDB: uploading ${items.length} items…\n${country}\n${breakdown}`);
 
     try {
       await submit(country, items);
-      setBadge(`Droqs DB: sent ✓\n${country}\nItems: ${items.length}\n${breakdown}`);
+      markUploaded(country);
+      showBadge(`DroqsDB: uploaded ✓\n${country}\nItems: ${items.length}`);
+      hideBadge(AUTO_HIDE_MS);
     } catch (e) {
-      setBadge(`Droqs DB: submit failed ✗\n${String(e)}`);
+      showBadge(`DroqsDB: upload failed ✗\n${country}\n${String(e)}`);
+      hideBadge(AUTO_HIDE_MS);
     }
   }
 
