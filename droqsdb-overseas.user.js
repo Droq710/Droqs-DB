@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DroqsDB Overseas Stock Reporter
 // @namespace    https://droqsdb.com/
-// @version      1.4.0
+// @version      1.4.2
 // @description  Collects overseas shop stock+prices and uploads to droqsdb.com (Desktop + TornPDA iOS fallback)
 // @author       Droq
 // @match        https://www.torn.com/page.php?sid=travel*
