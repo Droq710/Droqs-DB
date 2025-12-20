@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DroqsDB Overseas Stock Reporter
 // @namespace    https://droqsdb.com/
-// @version      1.4.2
+// @version      1.4.3
 // @description  Collects overseas shop stock+prices and uploads to droqsdb.com (Desktop + TornPDA iOS fallback)
 // @author       Droq
 // @match        https://www.torn.com/page.php?sid=travel*
@@ -89,11 +89,27 @@
     return String(s || "").replace(/\s+/g, " ").trim();
   }
 
+  // Supports:
+  //  - $20,000,000
+  //  - $20m / $20M
+  //  - $1.1m
+  //  - $950k
+  //  - $2.5b
   function parseMoney(text) {
-    const t = norm(text);
-    const m = t.match(/\$[\s]*([\d,]+)/);
+    const t = norm(text).replace(/\u00A0/g, " "); // nbsp safety
+    const m = t.match(/\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)(?:\s*([kKmMbB]))?/);
     if (!m) return null;
-    const n = Number(String(m[1]).replace(/,/g, ""));
+
+    let n = Number(String(m[1]).replace(/,/g, ""));
+    if (!Number.isFinite(n)) return null;
+
+    const suffix = (m[2] || "").toLowerCase();
+    if (suffix === "k") n *= 1e3;
+    else if (suffix === "m") n *= 1e6;
+    else if (suffix === "b") n *= 1e9;
+
+    // prices should be integers in Torn, round just in case (e.g. $1.1m)
+    n = Math.round(n);
     return Number.isFinite(n) ? n : null;
   }
 
@@ -321,8 +337,8 @@
 
         if (isClickable && isVisible(node)) {
           const txt = norm(node.innerText || node.textContent || "");
-          // Heuristic: must contain $number and at least one digit group
-          if (/\$\s*[\d,]+/.test(txt) && /\d[\d,]*/.test(txt)) {
+          // Heuristic: must contain $number (or $number+k/m/b) and at least one digit group
+          if (/\$\s*[\d,]+(?:\.\d+)?\s*[kKmMbB]?/.test(txt) && /\d[\d,]*/.test(txt)) {
             // Avoid capturing huge containers (page wrappers)
             if (txt.length > 0 && txt.length < 400) {
               const key = tag + "::" + txt;
@@ -343,7 +359,7 @@
   function parseCardTextLoose(text) {
     const t = norm(text);
 
-    // cost: first $xxx
+    // cost: first $xxx (supports k/m/b)
     const cost = parseMoney(t);
 
     // stock: try common patterns
@@ -409,7 +425,7 @@
       .filter((el) => {
         const txt = norm(el.innerText || "");
         if (txt.length < 20 || txt.length > 2000) return false;
-        if (!/\$\s*[\d,]+/.test(txt)) return false;
+        if (!/\$\s*[\d,]+(?:\.\d+)?\s*[kKmMbB]?/.test(txt)) return false;
         if (!/\b(Stock|Available|in stock)\b/i.test(txt)) return false;
         // modal often contains a close button text
         if (/\bClose\b/i.test(txt) || /\bBack\b/i.test(txt) || /×/.test(txt)) return true;
@@ -481,7 +497,7 @@
       if (isValidName(firstLine)) name = firstLine;
     }
 
-    // cost & stock from modal text
+    // cost & stock from modal text (supports k/m/b)
     const cost = parseMoney(text);
 
     let stock = null;
