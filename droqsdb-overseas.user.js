@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DroqsDB Overseas Stock Reporter
 // @namespace    https://droqsdb.com/
-// @version      1.4.3
+// @version      1.4.4
 // @description  Collects overseas shop stock+prices and uploads to droqsdb.com (Desktop + TornPDA iOS fallback)
 // @author       Droq
 // @match        https://www.torn.com/page.php?sid=travel*
@@ -16,6 +16,7 @@
 (() => {
   "use strict";
 
+  const SCRIPT_VERSION = "1.4.4";
   const API_URL = "https://droqsdb.com/api/report-stock";
 
   // Keep this OFF by default. If you ever need to debug a user’s issue,
@@ -184,13 +185,10 @@
   }
 
   function getRowsBetweenStrict(startEl, endEl) {
-    // We will walk the DOM in document order from startEl to endEl and collect rows.
-    // Row container looks like: <div class="row___wHVtu"> . </div>
     const rows = [];
 
     let node = startEl;
 
-    // helper: next node in DOM order
     const nextNode = (n) => {
       if (n.firstElementChild) return n.firstElementChild;
       while (n) {
@@ -200,7 +198,6 @@
       return null;
     };
 
-    // Move to the next node after header
     node = nextNode(startEl);
 
     while (node && node !== endEl) {
@@ -218,20 +215,16 @@
   }
 
   function extractItemFromRowStrict(rowEl, shop) {
-    // Name:
     const nameBtn = rowEl.querySelector('button[class*="itemNameButton"]');
     const name = nameBtn ? norm(nameBtn.textContent) : null;
     if (!isValidName(name)) return null;
 
-    // Cost:
     const priceEl = rowEl.querySelector('span[class*="displayPrice"]');
     const cost = priceEl ? parseMoney(priceEl.textContent) : null;
 
-    // Stock:
     const stockEl = rowEl.querySelector('div[data-tt-content-type="stock"]');
     let stock = null;
     if (stockEl) {
-      // contains srOnly + number, but textContent ends in the number
       const raw = norm(stockEl.textContent);
       const mm = raw.match(/(\d[\d,]*)\s*$/);
       stock = mm ? parseIntSafe(mm[1]) : parseIntSafe(raw);
@@ -244,7 +237,7 @@
       stock,
       cost,
       shop,
-      category: shop, // exactly matches the 3 headers
+      category: shop,
     };
   }
 
@@ -279,16 +272,7 @@
   }
 
   // ---------------- TornPDA fallback scraper (iOS-friendly) ----------------
-  //
-  // Strategy:
-  // 1) Try to find clickable “cards” and parse text (fast).
-  // 2) If parsing is incomplete, open the item modal (tap) and parse modal text (reliable).
-  //
-  // IMPORTANT: This only runs if STRICT returned 0 items (so desktop remains unaffected).
-  //
-
   function findShopHeaderElementsLoose() {
-    // Find visible elements whose text is exactly one of the shop names
     const candidates = Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6,div,span"))
       .map((el) => {
         const text = norm(el.textContent);
@@ -297,7 +281,6 @@
       .filter((x) => SHOP_NAMES.includes(x.text))
       .filter((x) => isVisible(x.el));
 
-    // Deduplicate by same element/text
     const out = [];
     const seen = new Set();
     for (const x of candidates) {
@@ -310,8 +293,6 @@
   }
 
   function getClickableCandidatesBetween(startEl, endEl) {
-    // Walk DOM order from startEl to endEl and collect clickable/tappable elements
-    // that contain a $price and some digits (stock).
     const items = [];
     const seen = new Set();
 
@@ -337,9 +318,7 @@
 
         if (isClickable && isVisible(node)) {
           const txt = norm(node.innerText || node.textContent || "");
-          // Heuristic: must contain $number (or $number+k/m/b) and at least one digit group
           if (/\$\s*[\d,]+(?:\.\d+)?\s*[kKmMbB]?/.test(txt) && /\d[\d,]*/.test(txt)) {
-            // Avoid capturing huge containers (page wrappers)
             if (txt.length > 0 && txt.length < 400) {
               const key = tag + "::" + txt;
               if (!seen.has(key)) {
@@ -358,44 +337,33 @@
 
   function parseCardTextLoose(text) {
     const t = norm(text);
-
-    // cost: first $xxx (supports k/m/b)
     const cost = parseMoney(t);
-
-    // stock: try common patterns
     let stock = null;
 
-    // e.g. "Stock 1,234" or "Stock: 1,234"
     let m = t.match(/\bStock\b\s*:?[\s]*([\d,]+)/i);
     if (m) stock = parseIntSafe(m[1]);
 
-    // e.g. "Available 1,234"
     if (stock === null) {
       m = t.match(/\bAvailable\b\s*:?[\s]*([\d,]+)/i);
       if (m) stock = parseIntSafe(m[1]);
     }
 
-    // e.g. "1,234 in stock"
     if (stock === null) {
       m = t.match(/([\d,]+)\s+in\s+stock\b/i);
       if (m) stock = parseIntSafe(m[1]);
     }
 
-    // name: best effort — take text before first $ and strip obvious labels
     let name = null;
     const idx = t.indexOf("$");
     if (idx > 1) {
       const before = norm(t.slice(0, idx));
-      // take first "line" chunk
       name = norm(before.split("  ")[0] || before);
     } else {
-      // fallback: first chunk with letters
       const chunks = t.split(" ").filter(Boolean);
       const firstFew = chunks.slice(0, 6).join(" ");
       if (/[A-Za-z]/.test(firstFew)) name = norm(firstFew);
     }
 
-    // sanitize name (remove shop words/labels if accidentally included)
     if (name) {
       name = name.replace(/\b(General Store|Arms Dealer|Black Market|Stock|Available)\b/gi, "").trim();
       name = norm(name);
@@ -409,17 +377,14 @@
   }
 
   function findOpenModal() {
-    // Look for dialog-ish container, or a visible overlay with lots of text including $ and Stock/Available
     const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]'))
       .filter(isVisible);
 
     if (dialogs.length) {
-      // pick the largest visible one
       dialogs.sort((a, b) => (b.getBoundingClientRect().height * b.getBoundingClientRect().width) - (a.getBoundingClientRect().height * a.getBoundingClientRect().width));
       return dialogs[0];
     }
 
-    // Fallback: sometimes modal has no ARIA roles; search for visible container with modal-ish traits
     const possibles = Array.from(document.querySelectorAll("div"))
       .filter(isVisible)
       .filter((el) => {
@@ -427,7 +392,6 @@
         if (txt.length < 20 || txt.length > 2000) return false;
         if (!/\$\s*[\d,]+(?:\.\d+)?\s*[kKmMbB]?/.test(txt)) return false;
         if (!/\b(Stock|Available|in stock)\b/i.test(txt)) return false;
-        // modal often contains a close button text
         if (/\bClose\b/i.test(txt) || /\bBack\b/i.test(txt) || /×/.test(txt)) return true;
         return false;
       });
@@ -441,7 +405,6 @@
   function tryCloseModal(modalEl) {
     if (!modalEl) return false;
 
-    // Try close buttons inside modal
     const closeBtn =
       modalEl.querySelector('button[aria-label*="close" i]') ||
       modalEl.querySelector('button[title*="close" i]') ||
@@ -455,8 +418,6 @@
       return true;
     }
 
-    // Fallback: tap outside (dispatch click on backdrop if exists)
-    // try nearest ancestor that looks like overlay and click it
     let p = modalEl.parentElement;
     for (let i = 0; i < 5 && p; i++) {
       const style = window.getComputedStyle(p);
@@ -472,10 +433,8 @@
   }
 
   async function parseViaModal(itemEl) {
-    // Click item to open modal
     itemEl.click();
 
-    // Wait for modal to appear
     let modal = null;
     for (let i = 0; i < 12; i++) {
       await sleep(120);
@@ -486,18 +445,15 @@
 
     const text = norm(modal.innerText || modal.textContent || "");
 
-    // name: prefer heading-like first line
     let name = null;
     const heading = modal.querySelector("h1,h2,h3,h4,h5,h6");
     if (heading) name = norm(heading.textContent);
 
     if (!isValidName(name)) {
-      // fallback: first chunk that looks like an item name
       const firstLine = norm(text.split("\n").map(norm).filter(Boolean)[0] || "");
       if (isValidName(firstLine)) name = firstLine;
     }
 
-    // cost & stock from modal text (supports k/m/b)
     const cost = parseMoney(text);
 
     let stock = null;
@@ -514,7 +470,6 @@
       if (m) stock = parseIntSafe(m[1]);
     }
 
-    // Close modal
     tryCloseModal(modal);
     await sleep(120);
 
@@ -533,17 +488,14 @@
     const allItems = [];
     const seen = new Set();
 
-    // Try to get items per shop section by walking DOM between headers
     for (let i = 0; i < headers.length; i++) {
       const headerEl = headers[i].el;
       const shop = normalizeShop(headers[i].text);
       if (!shop) continue;
 
       const endEl = headers[i + 1]?.el || null;
-
       const candidates = getClickableCandidatesBetween(headerEl, endEl);
 
-      // First pass: parse from card text
       const parsed = [];
       for (const el of candidates) {
         const txt = norm(el.innerText || el.textContent || "");
@@ -552,12 +504,10 @@
         if (p.name && p.cost !== null && p.stock !== null) {
           parsed.push({ el, ...p });
         } else if (p.name) {
-          // keep as maybe, modal can fix
           parsed.push({ el, ...p });
         }
       }
 
-      // Second pass: if too incomplete, use modal for missing fields (cap to avoid long loops)
       let completedCount = 0;
       for (const p of parsed) {
         let name = p.name;
@@ -565,7 +515,6 @@
         let stock = p.stock;
 
         if (!name || cost === null || stock === null) {
-          // Use modal (most reliable on iOS TornPDA)
           const modalData = await parseViaModal(p.el);
           if (modalData) {
             name = modalData.name;
@@ -589,13 +538,10 @@
         });
 
         completedCount++;
-        // Gentle pacing so we don’t overwhelm the WebView
         if (completedCount % 5 === 0) await sleep(180);
       }
     }
 
-    // Safety: avoid uploading junk if something went wrong
-    // If we found < 5 items total, treat it as failure (prevents bad uploads).
     if (allItems.length < 5) {
       debugBadge(`DroqsDB: TornPDA fallback\nToo few items (${allItems.length}) — abort`);
       return [];
@@ -608,12 +554,18 @@
   async function uploadReport(country, items) {
     const payload = JSON.stringify({ country, items });
 
+    const headers = {
+      "Content-Type": "application/json",
+      "X-DroqsDB-Client": "userscript",
+      "X-DroqsDB-Version": SCRIPT_VERSION,
+    };
+
     if (typeof GM_xmlhttpRequest === "function") {
       return await new Promise((resolve, reject) => {
         GM_xmlhttpRequest({
           method: "POST",
           url: API_URL,
-          headers: { "Content-Type": "application/json" },
+          headers,
           data: payload,
           timeout: 20000,
           onload: (res) => {
@@ -628,7 +580,7 @@
 
     const res = await fetch(API_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: payload,
       mode: "cors",
       credentials: "omit",
@@ -643,14 +595,12 @@
   let isBusy = false;
 
   async function collectItemsSmart() {
-    // 1) Try strict (desktop)
     const strictItems = collectItemsStrict();
     if (strictItems.length) {
       debugBadge(`DroqsDB: strict OK\nItems: ${strictItems.length}`);
       return { items: strictItems, mode: "strict" };
     }
 
-    // 2) TornPDA fallback (only if strict found nothing)
     const fallbackItems = await collectItemsTornPDA();
     if (fallbackItems.length) {
       debugBadge(`DroqsDB: fallback OK\nItems: ${fallbackItems.length}`);
@@ -665,14 +615,13 @@
     isBusy = true;
 
     try {
-      // Only run on travel page (already matched, but keep safe)
       if (!location.href.includes("page.php?sid=travel")) return;
 
       const country = getCountryName();
-      if (!country) return; // no badge, no noise
+      if (!country) return;
 
       const { items, mode } = await collectItemsSmart();
-      if (!items.length) return; // no badge, no noise
+      if (!items.length) return;
 
       const sig =
         country +
@@ -681,10 +630,9 @@
           .map((i) => `${i.shop}|${i.name}|${i.stock}|${i.cost}`)
           .join(";");
 
-      if (sig === lastSignature) return; // no badge, no noise
+      if (sig === lastSignature) return;
       lastSignature = sig;
 
-      // Badge ONLY during upload
       showBadge(`DroqsDB Uploading…\n${country}\nItems: ${items.length}\nMode: ${mode}`);
 
       try {
@@ -700,7 +648,6 @@
     }
   }
 
-  // Run once after load, then observe changes (React-style UI updates)
   scanAndMaybeUpload();
 
   const obs = new MutationObserver(() => {
