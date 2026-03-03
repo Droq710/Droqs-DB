@@ -4,6 +4,7 @@ This Tampermonkey userscript automatically collects overseas shop prices and sto
 when you visit an overseas location in Torn.
 
 ## Features
+- No API needed
 - No clicking required
 - No automation of gameplay
 - Collects only visible shop data
