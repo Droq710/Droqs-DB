@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DroqsDB Overseas Stock Reporter
 // @namespace    https://droqsdb.com/
-// @version      1.6.3
+// @version      1.6.4
 // @description  Collects overseas shop stock+prices and uploads to droqsdb.com (Desktop + TornPDA iOS fallback)
 // @author       Droq
 // @match        https://www.torn.com/page.php?sid=travel*
@@ -17,7 +17,7 @@
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "1.6.3";
+  const SCRIPT_VERSION = "1.6.4";
   const API_URL = "https://droqsdb.com/api/report-stock";
   const COMPANION_TRAVEL_PLANNER_API_URL = "https://droqsdb.com/api/companion/v1/travel-planner/query";
   const COMPANION_COUNTRY_HELPER_API_URL = "https://droqsdb.com/api/companion/v1/country-helper/query";
@@ -25,6 +25,8 @@
   const PAGE_READY_DEBOUNCE_MS = 250;
   const PAGE_READY_OBSERVER_TIMEOUT_MS = 8000;
   const COMPANION_STATE_DEBOUNCE_MS = 250;
+  const TRAVEL_SELECTION_CLEAR_GRACE_MS = 1200;
+  const TRAVEL_PLANNER_LAYOUT_GRACE_MS = 1500;
   const TEXT_ONLY_CELL_MAX_LENGTH = 120;
   const ROW_TEXT_MAX_LENGTH = 220;
   const MIN_FALLBACK_ITEMS = 5;
@@ -318,6 +320,17 @@
     return !settings.disableAllUi && settings.uploadToastEnabled;
   }
 
+  function markDroqsdbUiRoot(el, rootName) {
+    if (!el || el.nodeType !== 1) return el;
+    el.setAttribute("data-droqsdb-ui", "true");
+    if (rootName) el.setAttribute("data-droqsdb-ui-root", rootName);
+    return el;
+  }
+
+  function isDroqsdbUiNode(node) {
+    return Boolean(node?.closest?.('[data-droqsdb-ui="true"]'));
+  }
+
   // ---------------- Badge (ONLY during upload / debug) ----------------
   let badgeEl = null;
   let badgeTextEl = null;
@@ -343,7 +356,16 @@
   let companionStateObserver = null;
   let companionStateTimer = null;
   let companionInteractionTimer = null;
-  let lastTravelPlannerDebugSignature = null;
+  const companionDebugSignatures = {
+    planner: null,
+    helper: null,
+    selectedCountryCard: null,
+  };
+  const travelPlannerSelectionState = {
+    country: null,
+    clearRequestedAt: 0,
+    lastEligibleAt: 0,
+  };
   const settingsModalUiState = {
     itemQuery: "",
   };
@@ -487,39 +509,70 @@
     settingsOverlayEl.style.display = "none";
   }
 
+  function getUserscriptMenuCommandRegistrar() {
+    if (typeof GM_registerMenuCommand === "function") return GM_registerMenuCommand;
+    if (typeof GM === "object" && GM && typeof GM.registerMenuCommand === "function") {
+      return (label, handler) => GM.registerMenuCommand(label, handler);
+    }
+    return null;
+  }
+
+  function hasUserscriptMenuCommandSupport() {
+    return typeof getUserscriptMenuCommandRegistrar() === "function";
+  }
+
+  function isLikelyTornPdaOrMobile() {
+    const userAgent = typeof navigator === "object" ? String(navigator.userAgent || "") : "";
+    if (/tornpda/i.test(userAgent)) return true;
+
+    const touchPoints = typeof navigator === "object" ? Number(navigator.maxTouchPoints || 0) : 0;
+    const coarsePointer = typeof window.matchMedia === "function" && (
+      window.matchMedia("(pointer: coarse)").matches ||
+      window.matchMedia("(any-pointer: coarse)").matches ||
+      window.matchMedia("(hover: none)").matches
+    );
+    return /iphone|ipad|android|mobile/i.test(userAgent) || ((touchPoints > 0 || coarsePointer) && getViewportSize().width <= 1024);
+  }
+
   function shouldShowSettingsLauncher(settings = getSettings()) {
-    return isTravelPage() && settings.disableAllUi;
+    return isTravelPage() && (
+      settings.disableAllUi === true ||
+      !hasUserscriptMenuCommandSupport() ||
+      isLikelyTornPdaOrMobile()
+    );
   }
 
   function ensureSettingsLauncher() {
     if (settingsLauncherEl) return settingsLauncherEl;
 
     settingsLauncherEl = document.createElement("button");
+    markDroqsdbUiRoot(settingsLauncherEl, "settings-launcher");
     settingsLauncherEl.type = "button";
     settingsLauncherEl.textContent = "DB";
     settingsLauncherEl.setAttribute("aria-label", "Open DroqsDB settings");
     settingsLauncherEl.title = "Open DroqsDB settings";
     settingsLauncherEl.style.position = "fixed";
-    settingsLauncherEl.style.left = `${SETTINGS_LAUNCHER_EDGE_MARGIN}px`;
-    settingsLauncherEl.style.bottom = `${SETTINGS_LAUNCHER_EDGE_MARGIN}px`;
+    settingsLauncherEl.style.left = `calc(${SETTINGS_LAUNCHER_EDGE_MARGIN}px + env(safe-area-inset-left, 0px))`;
+    settingsLauncherEl.style.bottom = `calc(${SETTINGS_LAUNCHER_EDGE_MARGIN}px + env(safe-area-inset-bottom, 0px))`;
     settingsLauncherEl.style.zIndex = "999998";
     settingsLauncherEl.style.display = "none";
     settingsLauncherEl.style.alignItems = "center";
     settingsLauncherEl.style.justifyContent = "center";
-    settingsLauncherEl.style.minWidth = "32px";
-    settingsLauncherEl.style.height = "22px";
-    settingsLauncherEl.style.padding = "0 8px";
+    settingsLauncherEl.style.minWidth = "30px";
+    settingsLauncherEl.style.height = "20px";
+    settingsLauncherEl.style.padding = "0 7px";
     settingsLauncherEl.style.border = "1px solid rgba(255,255,255,0.18)";
     settingsLauncherEl.style.borderRadius = "999px";
     settingsLauncherEl.style.background = "rgba(0,0,0,0.45)";
     settingsLauncherEl.style.color = "rgba(255,255,255,0.78)";
     settingsLauncherEl.style.fontFamily = "Arial, sans-serif";
-    settingsLauncherEl.style.fontSize = "10px";
+    settingsLauncherEl.style.fontSize = "9px";
     settingsLauncherEl.style.fontWeight = "700";
     settingsLauncherEl.style.letterSpacing = "0.04em";
     settingsLauncherEl.style.cursor = "pointer";
-    settingsLauncherEl.style.opacity = "0.7";
+    settingsLauncherEl.style.opacity = "0.68";
     settingsLauncherEl.style.boxShadow = "0 4px 10px rgba(0,0,0,0.18)";
+    settingsLauncherEl.style.touchAction = "manipulation";
     settingsLauncherEl.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -978,6 +1031,7 @@
     if (settingsOverlayEl) return settingsOverlayEl;
 
     settingsOverlayEl = document.createElement("div");
+    markDroqsdbUiRoot(settingsOverlayEl, "settings-overlay");
     settingsOverlayEl.style.position = "fixed";
     settingsOverlayEl.style.inset = "0";
     settingsOverlayEl.style.zIndex = "1000000";
@@ -1447,12 +1501,7 @@
   }
 
   function registerUserscriptMenuCommands() {
-    const registerMenuCommand =
-      typeof GM_registerMenuCommand === "function"
-        ? GM_registerMenuCommand
-        : (typeof GM === "object" && GM && typeof GM.registerMenuCommand === "function"
-            ? (label, handler) => GM.registerMenuCommand(label, handler)
-            : null);
+    const registerMenuCommand = getUserscriptMenuCommandRegistrar();
     if (!registerMenuCommand) return;
 
     registerMenuCommand("Open DroqsDB Settings", () => {
@@ -1571,6 +1620,7 @@
   function ensureBadge() {
     if (badgeEl) return badgeEl;
     badgeEl = document.createElement("div");
+    markDroqsdbUiRoot(badgeEl, "upload-badge");
     badgeEl.style.position = "fixed";
     badgeEl.style.left = `${BADGE_EDGE_MARGIN}px`;
     badgeEl.style.top = `${BADGE_EDGE_MARGIN}px`;
@@ -1900,6 +1950,7 @@
 
     const chrome = getCompanionPanelChrome();
     companionLauncherEl = document.createElement("button");
+    markDroqsdbUiRoot(companionLauncherEl, "companion-launcher");
     companionLauncherEl.type = "button";
     companionLauncherEl.textContent = chrome.launcherLabel;
     companionLauncherEl.setAttribute("aria-label", chrome.launcherAriaLabel);
@@ -1938,6 +1989,7 @@
 
     const chrome = getCompanionPanelChrome();
     companionPanelEl = document.createElement("section");
+    markDroqsdbUiRoot(companionPanelEl, "companion-panel");
     companionPanelEl.setAttribute("aria-label", chrome.panelAriaLabel);
     companionPanelEl.style.position = "fixed";
     companionPanelEl.style.left = `${COMPANION_PANEL_EDGE_MARGIN}px`;
@@ -1946,6 +1998,7 @@
     companionPanelEl.style.display = "none";
     companionPanelEl.style.width = "min(300px, calc(100vw - 24px))";
     companionPanelEl.style.maxWidth = "calc(100vw - 24px)";
+    companionPanelEl.style.maxHeight = "calc(100vh - 24px)";
     companionPanelEl.style.border = "1px solid rgba(255,255,255,0.16)";
     companionPanelEl.style.borderRadius = "12px";
     companionPanelEl.style.background = "rgba(12,12,12,0.92)";
@@ -2037,6 +2090,8 @@
     companionPanelContentEl.style.padding = "10px";
     companionPanelContentEl.style.display = "grid";
     companionPanelContentEl.style.gap = "10px";
+    companionPanelContentEl.style.maxHeight = "calc(100vh - 74px)";
+    companionPanelContentEl.style.overflowY = "auto";
 
     companionPanelHeaderEl.addEventListener("mousedown", onCompanionPanelMouseDown);
     companionPanelHeaderEl.addEventListener("touchstart", onCompanionPanelTouchStart, { passive: false });
@@ -2186,6 +2241,11 @@
     if (emptyReason === "FILTERS_EXCLUDED_ALL_RESULTS") return "No qualifying run matches your saved filters.";
     if (emptyReason === "NO_QUALIFIED_RUNS") return "No arrival-safe run qualifies right now.";
     return "No profitable run is available right now.";
+  }
+
+  function getSelectedCountryEmptyMessage(emptyReason) {
+    if (emptyReason === "FILTERS_EXCLUDED_ALL_RESULTS") return "No qualifying items in this country match your saved filters.";
+    return "No profitable items currently estimated to be in stock on arrival.";
   }
 
   function getCountryHelperEmptyMessage(country, emptyReason) {
@@ -2358,10 +2418,17 @@
         status: companionPanelState.selected.status,
         entry: companionPanelState.selected.payload,
         country: companionPanelState.selected.country,
-        emptyText: "No profitable items found",
+        emptyText: getSelectedCountryEmptyMessage(companionPanelState.selected.emptyReason),
         showRunCost: settings.showRunCost,
       }));
     }
+
+    logSelectedCountryCardState({
+      rendered: companionPanelState.selected.status !== "hidden" && Boolean(companionPanelState.selected.country),
+      country: companionPanelState.selected.country,
+      status: companionPanelState.selected.status,
+      emptyReason: companionPanelState.selected.emptyReason,
+    });
   }
 
   function renderCountryHelperPanelContent(settings) {
@@ -2560,10 +2627,23 @@
     return norm(document.body?.innerText || document.body?.textContent || "");
   }
 
-  // Temporary low-noise console debug for travel planner eligibility.
+  function clearCompanionDebugSignatures() {
+    for (const key of Object.keys(companionDebugSignatures)) {
+      companionDebugSignatures[key] = null;
+    }
+  }
+
+  function logCompanionDebug(channel, label, payload) {
+    if (!DEBUG) return;
+    const signature = JSON.stringify(payload);
+    if (companionDebugSignatures[channel] === signature) return;
+    companionDebugSignatures[channel] = signature;
+    console.debug(`[DroqsDB] ${label}`, payload);
+  }
+
   function logTravelPlannerDetection(snapshot) {
     if (!isTravelPage()) {
-      lastTravelPlannerDebugSignature = null;
+      clearCompanionDebugSignatures();
       return;
     }
 
@@ -2572,11 +2652,43 @@
       inFlight: snapshot?.inFlight === true,
       travelAgency: snapshot?.travelAgency === true,
       selectedCountry: snapshot?.selectedCountry || null,
+      detectedSelectedCountry: snapshot?.detectedSelectedCountry || null,
+      stickySelectedCountry: snapshot?.stickySelectedCountry || null,
+      countryOptionCount: Number(snapshot?.countryOptionCount || 0),
     };
-    const signature = JSON.stringify(payload);
-    if (signature === lastTravelPlannerDebugSignature) return;
-    lastTravelPlannerDebugSignature = signature;
-    console.debug("[DroqsDB] Travel Planner detection", payload);
+    logCompanionDebug("planner", "Travel Planner detection", payload);
+  }
+
+  function logCountryHelperDetection(snapshot) {
+    if (!isTravelPage()) {
+      clearCompanionDebugSignatures();
+      return;
+    }
+
+    logCompanionDebug("helper", "Country Helper detection", {
+      eligible: snapshot?.eligible === true,
+      inFlight: snapshot?.inFlight === true,
+      shopPage: snapshot?.shopPage === true,
+      country: snapshot?.country || null,
+    });
+  }
+
+  function logSelectedCountryTransition(previousCountry, nextCountry, reason) {
+    if (!DEBUG) return;
+    console.debug("[DroqsDB] Selected country transition", {
+      from: previousCountry || null,
+      to: nextCountry || null,
+      reason: reason || "unknown",
+    });
+  }
+
+  function logSelectedCountryCardState(snapshot) {
+    logCompanionDebug("selectedCountryCard", "Selected country card", {
+      rendered: snapshot?.rendered === true,
+      country: snapshot?.country || null,
+      status: snapshot?.status || "hidden",
+      emptyReason: snapshot?.emptyReason || null,
+    });
   }
 
   function getTravelPageCountryFromBanner(text) {
@@ -2598,7 +2710,7 @@
     if (/\btravel agency\b/i.test(norm(document.title))) return true;
 
     return Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6,div,span,strong,b"))
-      .some((el) => isVisible(el) && /\btravel agency\b/i.test(getElementText(el)));
+      .some((el) => !isDroqsdbUiNode(el) && isVisible(el) && /\btravel agency\b/i.test(getElementText(el)));
   }
 
   function hasTravelDestinationPrompt(text = getVisibleTravelPageText()) {
@@ -2626,13 +2738,16 @@
     return hasInFlightDomSignals();
   }
 
-  function isTravelAgencySelectionState(text = getVisibleTravelPageText()) {
-    if (!text) return false;
+  function isTravelAgencySelectionState(text = getVisibleTravelPageText(), {
+    countryOptionCount = collectVisibleCountryLabelNodes().length,
+    selectedCountry = null,
+  } = {}) {
+    if (!text && countryOptionCount < 2 && !selectedCountry) return false;
     const hasHeading = hasTravelAgencyHeading();
     const hasPrompt = hasTravelDestinationPrompt(text);
-    const hasCountryOptions = collectVisibleCountryLabelNodes().length >= 2;
+    const hasCountryOptions = countryOptionCount >= 2;
     const hasDepartureCta = hasTravelDepartureCtaContext(text);
-    return hasHeading || hasPrompt || (hasCountryOptions && hasDepartureCta);
+    return hasHeading || hasPrompt || hasCountryOptions || Boolean(selectedCountry) || (countryOptionCount >= 1 && hasDepartureCta);
   }
 
   function collectVisibleCountryLabelNodes() {
@@ -2640,6 +2755,7 @@
     const nodes = Array.from(document.querySelectorAll("button,a,label,span,div,strong,b,h1,h2,h3,h4,h5,h6"));
 
     for (const el of nodes) {
+      if (isDroqsdbUiNode(el)) continue;
       if (!isVisible(el)) continue;
       const text = norm(el.textContent);
       const country = KNOWN_COUNTRY_NAMES.find((name) => text === name);
@@ -2682,6 +2798,7 @@
     const nodes = Array.from(document.querySelectorAll('button,a,input[type="button"],input[type="submit"]'));
 
     for (const el of nodes) {
+      if (isDroqsdbUiNode(el)) continue;
       if (!isVisible(el)) continue;
       const text = norm(el.value || el.innerText || el.textContent || "");
       if (!/\b(?:travel|fly|depart|book|confirm|continue)\b/i.test(text)) continue;
@@ -2691,10 +2808,10 @@
     return buttons;
   }
 
-  function getSelectedDestinationFromMarkers() {
+  function getSelectedDestinationFromMarkers(candidates = collectVisibleCountryLabelNodes()) {
     const scored = [];
 
-    for (const candidate of collectVisibleCountryLabelNodes()) {
+    for (const candidate of candidates) {
       let score = 0;
       let node = candidate.el;
       let depth = 0;
@@ -2736,8 +2853,91 @@
     return null;
   }
 
-  function getSelectedTravelDestinationCountry() {
-    return getSelectedDestinationFromMarkers() || getSelectedDestinationFromActionContext() || null;
+  function getSelectedTravelDestinationCountry(candidates = collectVisibleCountryLabelNodes()) {
+    return getSelectedDestinationFromMarkers(candidates) || getSelectedDestinationFromActionContext() || null;
+  }
+
+  function setTravelPlannerSelectedCountry(country, reason = "selection-confirmed") {
+    const nextCountry = KNOWN_COUNTRIES.has(String(country || "").trim()) ? String(country).trim() : null;
+    if (!nextCountry) return null;
+
+    const previousCountry = travelPlannerSelectionState.country || null;
+    travelPlannerSelectionState.country = nextCountry;
+    travelPlannerSelectionState.clearRequestedAt = 0;
+    if (previousCountry !== nextCountry) {
+      logSelectedCountryTransition(previousCountry, nextCountry, reason);
+    }
+    return nextCountry;
+  }
+
+  function resetTravelPlannerSelectedCountry(reason = "selection-cleared") {
+    const previousCountry = travelPlannerSelectionState.country || null;
+    travelPlannerSelectionState.country = null;
+    travelPlannerSelectionState.clearRequestedAt = 0;
+    travelPlannerSelectionState.lastEligibleAt = 0;
+    if (previousCountry) {
+      logSelectedCountryTransition(previousCountry, null, reason);
+    }
+  }
+
+  function resolveTravelPlannerSelectedCountry({
+    pageText,
+    travelAgency,
+    shopPage,
+    inFlight,
+    detectedSelectedCountry,
+    countryOptionCount,
+  }) {
+    if (!isTravelPage()) {
+      resetTravelPlannerSelectedCountry("left-travel-page");
+      return null;
+    }
+
+    if (shopPage) {
+      resetTravelPlannerSelectedCountry("entered-shop-page");
+      return null;
+    }
+
+    if (inFlight) {
+      resetTravelPlannerSelectedCountry("entered-in-flight-state");
+      return null;
+    }
+
+    if (travelAgency) {
+      travelPlannerSelectionState.lastEligibleAt = Date.now();
+    }
+
+    if (detectedSelectedCountry) {
+      return setTravelPlannerSelectedCountry(detectedSelectedCountry);
+    }
+
+    const stickyCountry = travelPlannerSelectionState.country || null;
+    if (!stickyCountry) {
+      travelPlannerSelectionState.clearRequestedAt = 0;
+      return null;
+    }
+
+    if (!travelAgency) {
+      return stickyCountry;
+    }
+
+    const clearlyDeselected = hasTravelDestinationPrompt(pageText) && countryOptionCount >= 2;
+    if (!clearlyDeselected) {
+      travelPlannerSelectionState.clearRequestedAt = 0;
+      return stickyCountry;
+    }
+
+    if (!travelPlannerSelectionState.clearRequestedAt) {
+      travelPlannerSelectionState.clearRequestedAt = Date.now();
+      return stickyCountry;
+    }
+
+    if ((Date.now() - travelPlannerSelectionState.clearRequestedAt) < TRAVEL_SELECTION_CLEAR_GRACE_MS) {
+      return stickyCountry;
+    }
+
+    resetTravelPlannerSelectedCountry("destination-clearly-deselected");
+    return null;
   }
 
   function getTravelPlannerPageContext(settings = getSettings()) {
@@ -2749,7 +2949,8 @@
     };
 
     if (!isTravelPage()) {
-      lastTravelPlannerDebugSignature = null;
+      clearCompanionDebugSignatures();
+      resetTravelPlannerSelectedCountry("left-travel-page");
       return context;
     }
 
@@ -2757,16 +2958,39 @@
     const travelPlannerEnabled = shouldEnableTravelPlanner(settings);
     const shopPage = Boolean(pageText) && (Boolean(getTravelPageCountryFromBanner(pageText)) || hasKnownShopHeaders());
     const inFlight = !shopPage && isLikelyInFlight(pageText);
-    const travelAgency = !shopPage && !inFlight && isTravelAgencySelectionState(pageText);
-    const selectedCountry = travelAgency ? getSelectedTravelDestinationCountry() : null;
+    const countryLabelNodes = collectVisibleCountryLabelNodes();
+    const detectedSelectedCountry = !shopPage && !inFlight
+      ? getSelectedTravelDestinationCountry(countryLabelNodes)
+      : null;
+    const travelAgency = !shopPage && !inFlight && isTravelAgencySelectionState(pageText, {
+      countryOptionCount: countryLabelNodes.length,
+      selectedCountry: detectedSelectedCountry,
+    });
+    const selectedCountry = resolveTravelPlannerSelectedCountry({
+      pageText,
+      travelAgency,
+      shopPage,
+      inFlight,
+      detectedSelectedCountry,
+      countryOptionCount: countryLabelNodes.length,
+    });
+    const recentlyEligible = travelPlannerSelectionState.lastEligibleAt > 0 &&
+      (Date.now() - travelPlannerSelectionState.lastEligibleAt) <= TRAVEL_PLANNER_LAYOUT_GRACE_MS;
 
-    context.eligible = travelPlannerEnabled && !shopPage && !inFlight && travelAgency;
+    context.eligible = travelPlannerEnabled && !shopPage && !inFlight && (
+      travelAgency ||
+      recentlyEligible ||
+      Boolean(selectedCountry)
+    );
     context.selectedCountry = context.eligible ? selectedCountry : null;
     logTravelPlannerDetection({
       eligible: context.eligible,
       inFlight,
       travelAgency,
-      selectedCountry,
+      selectedCountry: context.selectedCountry,
+      detectedSelectedCountry,
+      stickySelectedCountry: travelPlannerSelectionState.country,
+      countryOptionCount: countryLabelNodes.length,
     });
     return context;
   }
@@ -2788,6 +3012,12 @@
 
     context.eligible = shouldEnableCountryHelper(settings) && shopPage && !inFlight;
     context.country = context.eligible ? country : null;
+    logCountryHelperDetection({
+      eligible: context.eligible,
+      inFlight,
+      shopPage,
+      country: context.country || country,
+    });
     return context;
   }
 
@@ -3453,6 +3683,7 @@
         const text = norm(el.textContent);
         return { el, text };
       })
+      .filter((x) => !isDroqsdbUiNode(x.el))
       .filter((x) => SHOP_NAMES.includes(x.text))
       .filter((x) => isVisible(x.el));
 
@@ -3763,6 +3994,8 @@
   }
 
   registerUserscriptMenuCommands();
+  window.addEventListener("resize", () => syncSettingsLauncherVisibility(getSettings()));
+  window.addEventListener("orientationchange", () => syncSettingsLauncherVisibility(getSettings()));
   syncUiVisibilityWithSettings(getSettings());
   installCompanionStateObserver();
   installNavigationHooks();
