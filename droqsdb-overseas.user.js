@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DroqsDB Overseas Stock Reporter
 // @namespace    https://droqsdb.com/
-// @version      1.6.4
+// @version      1.6.8
 // @description  Collects overseas shop stock+prices and uploads to droqsdb.com (Desktop + TornPDA iOS fallback)
 // @author       Droq
 // @match        https://www.torn.com/page.php?sid=travel*
@@ -17,11 +17,12 @@
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "1.6.4";
+  const SCRIPT_VERSION = "1.6.8";
   const API_URL = "https://droqsdb.com/api/report-stock";
   const COMPANION_TRAVEL_PLANNER_API_URL = "https://droqsdb.com/api/companion/v1/travel-planner/query";
   const COMPANION_COUNTRY_HELPER_API_URL = "https://droqsdb.com/api/companion/v1/country-helper/query";
   const COMPANION_OPTIONS_API_URL = "https://droqsdb.com/api/companion/v1/options";
+  const COMPANION_RESPONSE_CACHE_TTL_MS = 45000;
   const PAGE_READY_DEBOUNCE_MS = 250;
   const PAGE_READY_OBSERVER_TIMEOUT_MS = 8000;
   const COMPANION_STATE_DEBOUNCE_MS = 250;
@@ -35,6 +36,20 @@
   const SETTINGS_CATEGORY_OPTIONS = Object.freeze([
     { value: "flowers", label: "Flowers" },
     { value: "plushies", label: "Plushies" },
+    { value: "drugs", label: "Drugs" },
+  ]);
+  const LEGACY_TRAVEL_PLANNER_DISPLAY_OPTIONS = Object.freeze([
+    { value: "best", label: "Best run only" },
+    { value: "top3", label: "Top 3 overall runs" },
+    { value: "categories", label: "Special categories (top 3 each)" },
+  ]);
+  const SETTINGS_TRAVEL_PLANNER_GENERAL_RESULTS_OPTIONS = Object.freeze([
+    { value: "best", label: "Best run only" },
+    { value: "top3", label: "Top 3 overall" },
+  ]);
+  const TRAVEL_PLANNER_SPECIAL_CATEGORY_OPTIONS = Object.freeze([
+    { value: "plushies", label: "Plushies" },
+    { value: "flowers", label: "Flowers" },
     { value: "drugs", label: "Drugs" },
   ]);
   const SETTINGS_SELL_WHERE_OPTIONS = Object.freeze([
@@ -83,10 +98,25 @@
   const SETTINGS_SCHEMA_VERSION = 1;
   const UI_STATE_SCHEMA_VERSION = 1;
 
+  function createDefaultTravelPlannerCategoryGroups() {
+    return {
+      plushies: false,
+      flowers: false,
+      drugs: false,
+    };
+  }
+
+  function createDefaultTravelPlannerSettings() {
+    return {
+      generalResultsCount: "best",
+      categoryGroups: createDefaultTravelPlannerCategoryGroups(),
+    };
+  }
+
   function createDefaultSettings() {
     return {
       schemaVersion: SETTINGS_SCHEMA_VERSION,
-      mode: "legacy",
+      mode: "enhanced",
       disableAllUi: false,
       uploadToastEnabled: true,
       showRunCost: true,
@@ -94,6 +124,7 @@
         travelPlannerEnabled: true,
         countryHelperEnabled: true,
       },
+      travelPlanner: createDefaultTravelPlannerSettings(),
       profit: {
         sellWhere: "market",
         applyTax: true,
@@ -187,8 +218,43 @@
     }
 
     const helpers = raw.helpers && typeof raw.helpers === "object" ? raw.helpers : {};
+    const travelPlanner = raw.travelPlanner && typeof raw.travelPlanner === "object" ? raw.travelPlanner : {};
     const profit = raw.profit && typeof raw.profit === "object" ? raw.profit : {};
     const filters = raw.filters && typeof raw.filters === "object" ? raw.filters : {};
+    const normalizedCountries = normalizeStringArray(filters.countries);
+    const normalizedCategoryFilters = normalizeStringArray(filters.categories);
+    const normalizedItemNames = normalizeStringArray(filters.itemNames);
+    const legacyDisplayMode = normalizeEnumString(
+      travelPlanner.displayMode,
+      LEGACY_TRAVEL_PLANNER_DISPLAY_OPTIONS.map((option) => option.value),
+      ""
+    );
+    const defaultTravelPlanner = createDefaultTravelPlannerSettings();
+    const rawCategoryGroups = travelPlanner.categoryGroups && typeof travelPlanner.categoryGroups === "object"
+      ? travelPlanner.categoryGroups
+      : {};
+    const hasExplicitCategoryGroups = TRAVEL_PLANNER_SPECIAL_CATEGORY_OPTIONS.some(
+      (option) => typeof rawCategoryGroups[option.value] === "boolean"
+    );
+    const migratedCategoryGroups = createDefaultTravelPlannerCategoryGroups();
+
+    if (hasExplicitCategoryGroups) {
+      TRAVEL_PLANNER_SPECIAL_CATEGORY_OPTIONS.forEach((option) => {
+        migratedCategoryGroups[option.value] = normalizeBoolean(
+          rawCategoryGroups[option.value],
+          defaultTravelPlanner.categoryGroups[option.value]
+        );
+      });
+    } else if (legacyDisplayMode === "categories") {
+      const legacyEnabledGroups = new Set(
+        normalizedCategoryFilters
+          .map((value) => String(value || "").trim().toLowerCase())
+          .filter(Boolean)
+      );
+      TRAVEL_PLANNER_SPECIAL_CATEGORY_OPTIONS.forEach((option) => {
+        migratedCategoryGroups[option.value] = !legacyEnabledGroups.size || legacyEnabledGroups.has(option.value);
+      });
+    }
 
     return {
       schemaVersion: SETTINGS_SCHEMA_VERSION,
@@ -199,6 +265,14 @@
       helpers: {
         travelPlannerEnabled: normalizeBoolean(helpers.travelPlannerEnabled, defaults.helpers.travelPlannerEnabled),
         countryHelperEnabled: normalizeBoolean(helpers.countryHelperEnabled, defaults.helpers.countryHelperEnabled),
+      },
+      travelPlanner: {
+        generalResultsCount: normalizeEnumString(
+          travelPlanner.generalResultsCount,
+          SETTINGS_TRAVEL_PLANNER_GENERAL_RESULTS_OPTIONS.map((option) => option.value),
+          legacyDisplayMode === "top3" ? "top3" : defaultTravelPlanner.generalResultsCount
+        ),
+        categoryGroups: migratedCategoryGroups,
       },
       profit: {
         sellWhere: normalizeEnumString(
@@ -222,9 +296,9 @@
           min: 0.5,
           allowNull: true,
         }),
-        countries: normalizeStringArray(filters.countries),
-        categories: normalizeStringArray(filters.categories),
-        itemNames: normalizeStringArray(filters.itemNames),
+        countries: normalizedCountries,
+        categories: normalizedCategoryFilters,
+        itemNames: normalizedItemNames,
       },
     };
   }
@@ -263,6 +337,22 @@
 
   function getSettings() {
     return normalizeSettings(loadStoredJson(SETTINGS_STORAGE_KEY));
+  }
+
+  function getTravelPlannerGeneralResultsCount(settings = getSettings()) {
+    const generalResultsCount = String(settings?.travelPlanner?.generalResultsCount || "").trim().toLowerCase();
+    if (generalResultsCount === "top3") return "top3";
+    return "best";
+  }
+
+  function isTravelPlannerCategoryGroupEnabled(settings = getSettings(), groupValue = "") {
+    const normalizedGroupValue = String(groupValue || "").trim().toLowerCase();
+    if (!normalizedGroupValue) return false;
+    return settings?.travelPlanner?.categoryGroups?.[normalizedGroupValue] === true;
+  }
+
+  function getTravelPlannerResultsLimit(settings = getSettings()) {
+    return getTravelPlannerGeneralResultsCount(settings) === "top3" ? 3 : 1;
   }
 
   function saveSettings(nextSettings) {
@@ -375,6 +465,7 @@
     error: null,
     promise: null,
   };
+  const companionResponseCache = new Map();
   const companionPanelState = {
     signature: null,
     requestToken: 0,
@@ -387,20 +478,24 @@
     global: {
       status: "idle",
       payload: null,
+      runs: [],
       emptyReason: null,
     },
     selected: {
       status: "hidden",
       country: null,
       payload: null,
+      runs: [],
       emptyReason: null,
     },
     countryHelper: {
       status: "idle",
       country: null,
       payload: null,
+      runs: [],
       emptyReason: null,
     },
+    categoryGroups: [],
   };
   const BADGE_EDGE_MARGIN = 10;
   const SETTINGS_LAUNCHER_EDGE_MARGIN = 8;
@@ -688,6 +783,7 @@
     const row = document.createElement("label");
     row.style.display = "block";
     row.style.padding = "6px 0";
+    row.style.opacity = disabled ? "0.6" : "1";
 
     row.appendChild(createSettingsFieldLabel(label));
 
@@ -699,14 +795,18 @@
     select.style.padding = "8px 10px";
     select.style.border = "1px solid rgba(255,255,255,0.18)";
     select.style.borderRadius = "8px";
-    select.style.background = "rgba(255,255,255,0.08)";
-    select.style.color = "#fff";
+    select.style.background = "rgba(24,33,48,0.96)";
+    select.style.color = "#f5f7fb";
     select.style.font = "inherit";
+    select.style.colorScheme = "dark";
 
     for (const option of options) {
       const optionEl = document.createElement("option");
       optionEl.value = option.value;
       optionEl.textContent = option.label;
+      optionEl.style.backgroundColor = "#182130";
+      optionEl.style.color = "#f5f7fb";
+      optionEl.style.font = "inherit";
       select.appendChild(optionEl);
     }
 
@@ -1224,10 +1324,43 @@
         });
       },
     }));
+    futureSection.appendChild(createSettingsSelectControl({
+      label: "General Result Count",
+      value: getTravelPlannerGeneralResultsCount(settings),
+      options: SETTINGS_TRAVEL_PLANNER_GENERAL_RESULTS_OPTIONS,
+      onChange: (event) => {
+        commitSettingsChange((next) => {
+          next.travelPlanner.generalResultsCount = normalizeEnumString(
+            event.target.value,
+            SETTINGS_TRAVEL_PLANNER_GENERAL_RESULTS_OPTIONS.map((option) => option.value),
+            next.travelPlanner.generalResultsCount
+          );
+        });
+      },
+    }));
+    const travelPlannerGroupsBlock = document.createElement("div");
+    travelPlannerGroupsBlock.style.padding = "6px 0";
+    travelPlannerGroupsBlock.appendChild(createSettingsFieldLabel("Additional Groups"));
+    TRAVEL_PLANNER_SPECIAL_CATEGORY_OPTIONS.forEach((option) => {
+      travelPlannerGroupsBlock.appendChild(createSettingsControl({
+        type: "checkbox",
+        label: `Show ${option.label}`,
+        checked: isTravelPlannerCategoryGroupEnabled(settings, option.value),
+        onChange: (event) => {
+          commitSettingsChange((next) => {
+            next.travelPlanner.categoryGroups[option.value] = Boolean(event.target.checked);
+          });
+        },
+      }));
+    });
+    futureSection.appendChild(travelPlannerGroupsBlock);
     futureSection.appendChild(createSettingsHint(
       helpersDisabled
         ? "Travel Planner surfaces only appear in Enhanced Mode. These helper settings still stay saved."
         : "Travel Planner uses the profitability and filter settings below."
+    ));
+    futureSection.appendChild(createSettingsHint(
+      "General results show either the single best backend-ranked run or the top 3 overall. Selected groups add matching Plushies, Flowers, and Drugs sections."
     ));
 
     const profitSection = createSettingsSection("Profitability");
@@ -2193,6 +2326,19 @@
     statsGrid.appendChild(createCompanionStat("Profit / Min", formatCompanionNumber(entry?.profitPerMinute, { currency: true })));
   }
 
+  function getTravelPlannerCategoryGroupConfigs(settings = getSettings()) {
+    return TRAVEL_PLANNER_SPECIAL_CATEGORY_OPTIONS
+      .filter((option) => isTravelPlannerCategoryGroupEnabled(settings, option.value))
+      .map((option) => ({ ...option }));
+  }
+
+  function getCompanionResultRankLabel(index) {
+    if (index === 0) return "Best";
+    if (index === 1) return "2nd";
+    if (index === 2) return "3rd";
+    return `#${Number(index) + 1}`;
+  }
+
   function formatCompanionNumber(value, { currency = false } = {}) {
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) return "—";
@@ -2255,6 +2401,193 @@
     return `No qualifying item is available in ${country}.`;
   }
 
+  function getTravelPlannerCategoryGroupsEmptyMessage(groups) {
+    const categoryGroups = Array.isArray(groups) ? groups : [];
+    if (categoryGroups.some((group) => group?.status === "unavailable")) {
+      return "Selected category groups are unavailable right now.";
+    }
+
+    const emptyReasons = categoryGroups
+      .map((group) => String(group?.emptyReason || "").trim())
+      .filter(Boolean);
+
+    if (emptyReasons.length && emptyReasons.every((reason) => reason === "FILTERS_EXCLUDED_ALL_RESULTS")) {
+      return "No selected category group matches your saved filters.";
+    }
+    if (emptyReasons.length && emptyReasons.every((reason) => reason === "NO_QUALIFIED_RUNS")) {
+      return "No arrival-safe run qualifies in the selected category groups right now.";
+    }
+    return "No profitable run is available in the selected category groups right now.";
+  }
+
+  function buildCompanionResultEntryCard(entry, {
+    rankLabel = "",
+    showCountryMeta = true,
+    showCategoryMeta = true,
+    countryOverride = null,
+    showBuyPrice = true,
+    showRunCost = false,
+    hideMissingStock = false,
+    showArrivalStockNote = false,
+  } = {}) {
+    const card = document.createElement("article");
+    card.style.padding = "8px";
+    card.style.border = "1px solid rgba(255,255,255,0.08)";
+    card.style.borderRadius = "8px";
+    card.style.background = "rgba(255,255,255,0.025)";
+    card.style.boxSizing = "border-box";
+    card.style.minWidth = "0";
+
+    if (rankLabel) {
+      card.appendChild(createCompanionTextBlock(rankLabel, {
+        fontSize: "10px",
+        fontWeight: "700",
+        textTransform: "uppercase",
+        letterSpacing: "0.04em",
+        color: "rgba(255,255,255,0.6)",
+        marginBottom: "4px",
+      }));
+    }
+
+    const titleRow = createCompanionTextBlock(entry.itemName || "Unknown item", {
+      fontSize: "13px",
+      fontWeight: "700",
+      lineHeight: "1.35",
+      marginBottom: "4px",
+    });
+
+    const metaParts = [];
+    const displayCountry = countryOverride || entry.country || null;
+    if (showCountryMeta && displayCountry) metaParts.push(displayCountry);
+    if (showCategoryMeta && (entry.category || entry.shopCategory)) metaParts.push(entry.category || entry.shopCategory);
+    if (metaParts.length) {
+      card.appendChild(titleRow);
+      card.appendChild(createCompanionTextBlock(metaParts.join(" · "), {
+        fontSize: "11px",
+        color: "rgba(255,255,255,0.66)",
+        lineHeight: "1.35",
+        marginBottom: "8px",
+      }));
+    } else {
+      titleRow.style.marginBottom = "8px";
+      card.appendChild(titleRow);
+    }
+
+    const statsGrid = document.createElement("div");
+    statsGrid.style.display = "grid";
+    statsGrid.style.gridTemplateColumns = "repeat(2, minmax(0, 1fr))";
+    statsGrid.style.gap = "8px 10px";
+    appendCompanionStatsGrid(statsGrid, entry, {
+      showBuyPrice,
+      showRunCost,
+      hideMissingStock,
+    });
+    card.appendChild(statsGrid);
+
+    if (showArrivalStockNote && shouldShowCompanionArrivalStockNote(entry)) {
+      card.appendChild(createCompanionTextBlock("Currently out of stock; expected in stock on arrival.", {
+        marginTop: "8px",
+        fontSize: "11px",
+        color: "rgba(255,255,255,0.62)",
+        lineHeight: "1.35",
+      }));
+    }
+
+    const sourceText = getCompanionSourceFreshnessText(entry);
+    if (sourceText) {
+      card.appendChild(createCompanionTextBlock(sourceText, {
+        marginTop: "8px",
+        fontSize: "11px",
+        color: "rgba(255,255,255,0.58)",
+        lineHeight: "1.35",
+      }));
+    }
+
+    return card;
+  }
+
+  function buildCompanionResultListSection({
+    title,
+    status,
+    entries,
+    emptyText,
+    showCountryMeta = true,
+    showCategoryMeta = true,
+    countryOverride = null,
+    showBuyPrice = true,
+    showRunCost = false,
+    hideMissingStock = false,
+    treatUnavailableAsEmpty = false,
+    showArrivalStockNote = false,
+    loadingText = "Loading...",
+  }) {
+    const section = document.createElement("section");
+    section.style.padding = "10px";
+    section.style.border = "1px solid rgba(255,255,255,0.08)";
+    section.style.borderRadius = "10px";
+    section.style.background = "rgba(255,255,255,0.03)";
+
+    const resolvedStatus = treatUnavailableAsEmpty && status === "unavailable" ? "empty" : status;
+    const heading = createCompanionTextBlock(title, {
+      fontSize: "11px",
+      fontWeight: "700",
+      textTransform: "uppercase",
+      letterSpacing: "0.04em",
+      color: "rgba(255,255,255,0.72)",
+      marginBottom: "8px",
+    });
+    section.appendChild(heading);
+
+    if (resolvedStatus === "loading" || resolvedStatus === "hidden" || resolvedStatus === "queued") {
+      section.appendChild(createCompanionTextBlock(loadingText, {
+        fontSize: "12px",
+        color: "rgba(255,255,255,0.72)",
+        lineHeight: "1.4",
+      }));
+      return section;
+    }
+
+    if (resolvedStatus === "unavailable") {
+      section.appendChild(createCompanionTextBlock("Unavailable right now.", {
+        fontSize: "12px",
+        color: "rgba(255,255,255,0.64)",
+        lineHeight: "1.4",
+      }));
+      return section;
+    }
+
+    const visibleEntries = (Array.isArray(entries) ? entries : []).filter(Boolean);
+    if (resolvedStatus !== "ready" || !visibleEntries.length) {
+      section.appendChild(createCompanionTextBlock(emptyText, {
+        fontSize: "12px",
+        color: "rgba(255,255,255,0.68)",
+        lineHeight: "1.4",
+      }));
+      return section;
+    }
+
+    const entriesWrap = document.createElement("div");
+    entriesWrap.style.display = "grid";
+    entriesWrap.style.gap = "8px";
+    entriesWrap.style.minWidth = "0";
+
+    visibleEntries.forEach((entry, index) => {
+      entriesWrap.appendChild(buildCompanionResultEntryCard(entry, {
+        rankLabel: getCompanionResultRankLabel(index),
+        showCountryMeta,
+        showCategoryMeta,
+        countryOverride,
+        showBuyPrice,
+        showRunCost,
+        hideMissingStock,
+        showArrivalStockNote,
+      }));
+    });
+
+    section.appendChild(entriesWrap);
+    return section;
+  }
+
   function buildCompanionResultSection({
     title,
     status,
@@ -2268,6 +2601,7 @@
     hideMissingStock = false,
     treatUnavailableAsEmpty = false,
     showArrivalStockNote = false,
+    loadingText = "Loading...",
   }) {
     const section = document.createElement("section");
     section.style.padding = "10px";
@@ -2287,8 +2621,8 @@
     });
     section.appendChild(heading);
 
-    if (resolvedStatus === "loading") {
-      section.appendChild(createCompanionTextBlock("Loading...", {
+    if (resolvedStatus === "loading" || resolvedStatus === "queued") {
+      section.appendChild(createCompanionTextBlock(loadingText, {
         fontSize: "12px",
         color: "rgba(255,255,255,0.72)",
         lineHeight: "1.4",
@@ -2371,7 +2705,32 @@
     return section;
   }
 
-  function buildCompanionCountryResultSection({ status, entry, country, emptyText, showRunCost = false }) {
+  function buildCompanionCountryResultSection({
+    status,
+    entry,
+    entries,
+    country,
+    emptyText,
+    showRunCost = false,
+    resultsMode = "best",
+  }) {
+    if (resultsMode === "top3") {
+      return buildCompanionResultListSection({
+        title: "For This Country",
+        status,
+        entries,
+        emptyText,
+        showCountryMeta: false,
+        showCategoryMeta: false,
+        countryOverride: country,
+        showBuyPrice: true,
+        showRunCost,
+        hideMissingStock: true,
+        treatUnavailableAsEmpty: true,
+        loadingText: "Checking this country...",
+      });
+    }
+
     return buildCompanionResultSection({
       title: "For This Country",
       status,
@@ -2384,6 +2743,7 @@
       showRunCost,
       hideMissingStock: true,
       treatUnavailableAsEmpty: true,
+      loadingText: "Checking this country...",
     });
   }
 
@@ -2399,27 +2759,99 @@
       showBuyPrice: true,
       showRunCost,
       hideMissingStock: true,
+      loadingText: "Checking this country...",
     });
   }
 
   function renderTravelPlannerPanelContent(settings) {
-    companionPanelContentEl.appendChild(buildCompanionResultSection({
-      title: "Best Run Right Now",
-      status: companionPanelState.global.status,
-      entry: companionPanelState.global.payload,
-      emptyText: getTravelPlannerEmptyMessage(companionPanelState.global.emptyReason),
-      showCountryMeta: true,
-      showRunCost: settings.showRunCost,
-      showArrivalStockNote: true,
-    }));
+    const generalResultsCount = getTravelPlannerGeneralResultsCount(settings);
+
+    if (generalResultsCount === "top3") {
+      companionPanelContentEl.appendChild(buildCompanionResultListSection({
+        title: "Top Runs Right Now",
+        status: companionPanelState.global.status === "hidden" ? "loading" : companionPanelState.global.status,
+        entries: companionPanelState.global.runs,
+        emptyText: getTravelPlannerEmptyMessage(companionPanelState.global.emptyReason),
+        showCountryMeta: true,
+        showRunCost: settings.showRunCost,
+        showArrivalStockNote: true,
+        loadingText: "Loading general results...",
+      }));
+    } else {
+      companionPanelContentEl.appendChild(buildCompanionResultSection({
+        title: "Best Run Right Now",
+        status: companionPanelState.global.status === "hidden" ? "loading" : companionPanelState.global.status,
+        entry: companionPanelState.global.payload,
+        emptyText: getTravelPlannerEmptyMessage(companionPanelState.global.emptyReason),
+        showCountryMeta: true,
+        showRunCost: settings.showRunCost,
+        showArrivalStockNote: true,
+        loadingText: "Loading general result...",
+      }));
+    }
+
+    const categoryGroups = Array.isArray(companionPanelState.categoryGroups) ? companionPanelState.categoryGroups : [];
+    if (categoryGroups.length) {
+      const visibleGroups = categoryGroups.filter((group) => {
+        if (group?.status === "ready") return Array.isArray(group.runs) && group.runs.length > 0;
+        return group?.status === "unavailable";
+      });
+      const hasPendingCategoryGroups = categoryGroups.some((group) => group?.status === "queued" || group?.status === "loading");
+      const generalHasContent = companionPanelState.global.status === "ready"
+        && (generalResultsCount === "top3"
+          ? Array.isArray(companionPanelState.global.runs) && companionPanelState.global.runs.length > 0
+          : Boolean(companionPanelState.global.payload));
+      const selectedHasContent = companionPanelState.selected.status === "ready"
+        && (generalResultsCount === "top3"
+          ? Array.isArray(companionPanelState.selected.runs) && companionPanelState.selected.runs.length > 0
+          : Boolean(companionPanelState.selected.payload));
+
+      if (hasPendingCategoryGroups && !visibleGroups.length && !generalHasContent && !selectedHasContent) {
+        companionPanelContentEl.appendChild(buildCompanionResultListSection({
+          title: "Selected Categories",
+          status: "loading",
+          entries: [],
+          emptyText: getTravelPlannerCategoryGroupsEmptyMessage(categoryGroups),
+          showCountryMeta: true,
+          showRunCost: settings.showRunCost,
+          showArrivalStockNote: true,
+          loadingText: "Checking selected categories...",
+        }));
+      } else if (!visibleGroups.length && !hasPendingCategoryGroups && !generalHasContent) {
+        companionPanelContentEl.appendChild(buildCompanionResultListSection({
+          title: "Selected Categories",
+          status: "empty",
+          entries: [],
+          emptyText: getTravelPlannerCategoryGroupsEmptyMessage(categoryGroups),
+          showCountryMeta: true,
+          showRunCost: settings.showRunCost,
+          showArrivalStockNote: true,
+        }));
+      }
+
+      for (const group of visibleGroups) {
+        companionPanelContentEl.appendChild(buildCompanionResultListSection({
+          title: group.label,
+          status: group.status,
+          entries: group.runs,
+          emptyText: getTravelPlannerEmptyMessage(group.emptyReason),
+          showCountryMeta: true,
+          showCategoryMeta: false,
+          showRunCost: settings.showRunCost,
+          showArrivalStockNote: true,
+        }));
+      }
+    }
 
     if (companionPanelState.selected.status !== "hidden" && companionPanelState.selected.country) {
       companionPanelContentEl.appendChild(buildCompanionCountryResultSection({
         status: companionPanelState.selected.status,
         entry: companionPanelState.selected.payload,
+        entries: companionPanelState.selected.runs,
         country: companionPanelState.selected.country,
         emptyText: getSelectedCountryEmptyMessage(companionPanelState.selected.emptyReason),
         showRunCost: settings.showRunCost,
+        resultsMode: generalResultsCount,
       }));
     }
 
@@ -2468,20 +2900,27 @@
     };
   }
 
-  function buildTravelPlannerQueryBody(settings) {
+  function buildTravelPlannerQueryBody(settings, {
+    limit = 1,
+    categories = null,
+  } = {}) {
+    const normalizedCategories = Array.isArray(categories)
+      ? normalizeStringArray(categories).map((value) => value.toLowerCase())
+      : normalizeStringArray(settings.filters.categories).map((value) => value.toLowerCase());
+
     return {
       settings: buildCompanionRequestSettings(settings),
       filters: {
         roundTripHours: settings.filters.roundTripHours,
         countries: [...settings.filters.countries],
-        categories: [...settings.filters.categories],
+        categories: normalizedCategories,
         itemNames: [...settings.filters.itemNames],
       },
-      limit: 1,
+      limit: normalizeInteger(limit, 1, { min: 1, max: 25 }),
     };
   }
 
-  function buildCountryHelperQueryBody(settings, country) {
+  function buildCountryHelperQueryBody(settings, country, { limit = 1 } = {}) {
     return {
       country,
       settings: buildCompanionRequestSettings(settings),
@@ -2489,7 +2928,7 @@
         categories: [...settings.filters.categories],
         itemNames: [...settings.filters.itemNames],
       },
-      limit: 1,
+      limit: normalizeInteger(limit, 1, { min: 1, max: 25 }),
     };
   }
 
@@ -2588,25 +3027,97 @@
     return parsed;
   }
 
-  async function safePostCompanionJson(url, body) {
+  function buildCompanionResponseCacheKey(url, body) {
+    return `${String(url || "")}::${JSON.stringify(body || null)}`;
+  }
+
+  function clearCompanionResponseCache() {
+    companionResponseCache.clear();
+  }
+
+  function pruneCompanionResponseCache(now = Date.now()) {
+    for (const [key, entry] of companionResponseCache.entries()) {
+      if (!entry) {
+        companionResponseCache.delete(key);
+        continue;
+      }
+      if (entry.promise) continue;
+      if (Number(entry.expiresAt) > now) continue;
+      companionResponseCache.delete(key);
+    }
+  }
+
+  async function postCompanionJsonCached(url, body, { ttlMs = COMPANION_RESPONSE_CACHE_TTL_MS } = {}) {
+    const cacheKey = buildCompanionResponseCacheKey(url, body);
+    const now = Date.now();
+    const normalizedTtlMs = normalizeInteger(ttlMs, COMPANION_RESPONSE_CACHE_TTL_MS, { min: 1000, max: 60000 });
+    pruneCompanionResponseCache(now);
+
+    const cachedEntry = companionResponseCache.get(cacheKey);
+    if (cachedEntry?.promise) {
+      return cachedEntry.promise;
+    }
+    if (cachedEntry?.payload && Number(cachedEntry.expiresAt) > now) {
+      return cachedEntry.payload;
+    }
+
+    const requestPromise = postCompanionJson(url, body)
+      .then((payload) => {
+        companionResponseCache.set(cacheKey, {
+          payload,
+          expiresAt: Date.now() + normalizedTtlMs,
+        });
+        return payload;
+      })
+      .catch((error) => {
+        companionResponseCache.delete(cacheKey);
+        throw error;
+      });
+
+    companionResponseCache.set(cacheKey, {
+      promise: requestPromise,
+      expiresAt: 0,
+      payload: null,
+    });
+
+    return requestPromise;
+  }
+
+  async function safePostCompanionJson(url, body, options) {
     try {
-      return await postCompanionJson(url, body);
+      return await postCompanionJsonCached(url, body, options);
     } catch {
       return null;
     }
   }
 
-  function applyTravelPlannerPayload(payload) {
+  function createTravelPlannerCategoryGroupState(group, status = "queued") {
+    return {
+      key: group?.value || null,
+      label: group?.label || "Category",
+      status,
+      payload: null,
+      runs: [],
+      emptyReason: null,
+    };
+  }
+
+  function applyTravelPlannerPayload(payload, target = companionPanelState.global) {
     if (!payload || payload.ok !== true) {
-      companionPanelState.global.status = "unavailable";
-      companionPanelState.global.payload = null;
-      companionPanelState.global.emptyReason = null;
+      target.status = "unavailable";
+      target.payload = null;
+      target.runs = [];
+      target.emptyReason = null;
       return;
     }
 
-    companionPanelState.global.payload = payload.bestRun || null;
-    companionPanelState.global.emptyReason = String(payload.emptyReason || "").trim() || null;
-    companionPanelState.global.status = payload.bestRun ? "ready" : "empty";
+    const runs = (Array.isArray(payload.runs) ? payload.runs : []).filter(Boolean);
+    if (!runs.length && payload.bestRun) runs.push(payload.bestRun);
+
+    target.payload = runs[0] || payload.bestRun || null;
+    target.runs = runs;
+    target.emptyReason = String(payload.emptyReason || "").trim() || null;
+    target.status = target.payload ? "ready" : "empty";
   }
 
   function applyCountryHelperPayload(country, payload, target = companionPanelState.selected) {
@@ -2614,13 +3125,18 @@
     if (!payload || payload.ok !== true) {
       target.status = "unavailable";
       target.payload = null;
+      target.runs = [];
       target.emptyReason = null;
       return;
     }
 
-    target.payload = payload.bestItem || null;
+    const runs = (Array.isArray(payload.items) ? payload.items : []).filter(Boolean);
+    if (!runs.length && payload.bestItem) runs.push(payload.bestItem);
+
+    target.payload = runs[0] || payload.bestItem || null;
+    target.runs = runs;
     target.emptyReason = String(payload.emptyReason || "").trim() || null;
-    target.status = payload.bestItem ? "ready" : "empty";
+    target.status = target.payload ? "ready" : "empty";
   }
 
   function getVisibleTravelPageText() {
@@ -2715,7 +3231,7 @@
 
   function hasTravelDestinationPrompt(text = getVisibleTravelPageText()) {
     if (!text) return false;
-    return /\b(?:please\s+choose\s+(?:a\s+)?destination|choose\s+(?:a\s+)?destination|select\s+(?:a\s+)?destination)\b/i.test(text);
+    return /\b(?:please\s+choose\s+(?:a\s+)?destination|choose\s+(?:a\s+)?destination|choose\s+destination|select\s+(?:a\s+)?destination|pick\s+(?:a\s+)?destination|where\s+would\s+you\s+like\s+to\s+(?:travel|fly)|choose\s+where\s+to\s+fly)\b/i.test(text);
   }
 
   function hasTravelDepartureCtaContext(text = getVisibleTravelPageText()) {
@@ -2750,17 +3266,82 @@
     return hasHeading || hasPrompt || hasCountryOptions || Boolean(selectedCountry) || (countryOptionCount >= 1 && hasDepartureCta);
   }
 
+  function getCountryDetectionTexts(el) {
+    if (!el || el.nodeType !== 1) return [];
+
+    const texts = [
+      getElementText(el),
+      norm(el.getAttribute("aria-label") || ""),
+      norm(el.getAttribute("title") || ""),
+      norm(el.getAttribute("value") || ""),
+      norm(el.getAttribute("data-country") || ""),
+      norm(el.getAttribute("data-destination") || ""),
+      norm(el.getAttribute("data-location") || ""),
+      norm(el.getAttribute("alt") || ""),
+    ];
+
+    const seen = new Set();
+    return texts.filter((text) => {
+      if (!text || seen.has(text)) return false;
+      seen.add(text);
+      return true;
+    });
+  }
+
+  function getCountryCandidateFromElement(el) {
+    if (!el || el.nodeType !== 1) return null;
+
+    const tagName = String(el.tagName || "").toLowerCase();
+    const role = String(el.getAttribute("role") || "").toLowerCase();
+    const isInteractive = ["button", "a", "label", "input", "option"].includes(tagName) ||
+      ["button", "tab", "option", "radio", "checkbox", "link"].includes(role);
+    const texts = getCountryDetectionTexts(el);
+
+    for (const text of texts) {
+      const exactCountry = KNOWN_COUNTRY_NAMES.find((country) => text === country);
+      if (exactCountry) {
+        return {
+          country: exactCountry,
+          score: 120,
+          text,
+        };
+      }
+    }
+
+    for (const text of texts) {
+      if (text.length > 180) continue;
+      const countries = findCountriesInText(text);
+      if (countries.length !== 1) continue;
+      const country = countries[0];
+      const hasSelectionContext = /\b(?:destination|travel(?:ing|ling)?\s+to|fly(?:ing)?\s+to|depart(?:ure)?\s+to|headed\s+to|going\s+to|selected|route)\b/i.test(text);
+      const compactText = text.length <= Math.max(country.length + 48, 96);
+      if (!hasSelectionContext && !isInteractive && !compactText && !hasSelectedStateSignals(el)) continue;
+      return {
+        country,
+        score: hasSelectionContext ? 90 : compactText ? 80 : 70,
+        text,
+      };
+    }
+
+    return null;
+  }
+
   function collectVisibleCountryLabelNodes() {
     const candidates = [];
-    const nodes = Array.from(document.querySelectorAll("button,a,label,span,div,strong,b,h1,h2,h3,h4,h5,h6"));
+    const nodes = Array.from(document.querySelectorAll(
+      'button,a,label,span,div,strong,b,h1,h2,h3,h4,h5,h6,li,p,input,[role="button"],[role="tab"],[role="option"],[role="radio"],[role="checkbox"]'
+    ));
 
     for (const el of nodes) {
       if (isDroqsdbUiNode(el)) continue;
       if (!isVisible(el)) continue;
-      const text = norm(el.textContent);
-      const country = KNOWN_COUNTRY_NAMES.find((name) => text === name);
-      if (!country) continue;
-      candidates.push({ el, country });
+      const match = getCountryCandidateFromElement(el);
+      if (!match) continue;
+      candidates.push({
+        el,
+        country: match.country,
+        score: match.score,
+      });
     }
 
     return candidates.filter((candidate, index) => !candidates.some(
@@ -2795,7 +3376,9 @@
 
   function collectVisibleTravelActionButtons() {
     const buttons = [];
-    const nodes = Array.from(document.querySelectorAll('button,a,input[type="button"],input[type="submit"]'));
+    const nodes = Array.from(document.querySelectorAll(
+      'button,a,input[type="button"],input[type="submit"],[role="button"]'
+    ));
 
     for (const el of nodes) {
       if (isDroqsdbUiNode(el)) continue;
@@ -2806,6 +3389,77 @@
     }
 
     return buttons;
+  }
+
+  function pickBestCountryFromScores(scored) {
+    if (!Array.isArray(scored) || !scored.length) return null;
+
+    const totals = new Map();
+    for (const entry of scored) {
+      if (!entry?.country || !Number.isFinite(entry.score)) continue;
+      const previous = totals.get(entry.country) || 0;
+      totals.set(entry.country, Math.max(previous, entry.score));
+    }
+
+    const ranked = Array.from(totals.entries())
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    if (!ranked.length) return null;
+    if (ranked[1] && ranked[1][1] === ranked[0][1] && ranked[1][0] !== ranked[0][0]) return null;
+    return ranked[0][0];
+  }
+
+  function scoreCountryFromNodeContext(node, baseScore = 80, maxDepth = 4) {
+    const scored = [];
+    let current = node;
+    let depth = 0;
+
+    while (current && depth <= maxDepth) {
+      if (!isDroqsdbUiNode(current)) {
+        const match = getCountryCandidateFromElement(current);
+        if (match) {
+          scored.push({
+            country: match.country,
+            score: Math.max(1, baseScore + match.score - (depth * 12)),
+          });
+        }
+      }
+      current = current.parentElement;
+      depth += 1;
+    }
+
+    return pickBestCountryFromScores(scored);
+  }
+
+  function getSelectedDestinationFromCheckedInputs() {
+    const scored = [];
+    const nodes = Array.from(document.querySelectorAll(
+      'input[type="radio"]:checked,input[type="checkbox"]:checked,option:checked,[aria-checked="true"],[role="radio"][aria-checked="true"],[role="tab"][aria-selected="true"],[role="option"][aria-selected="true"]'
+    ));
+
+    for (const el of nodes) {
+      if (isDroqsdbUiNode(el)) continue;
+
+      const contextCountry = scoreCountryFromNodeContext(el, 70, 4);
+      if (contextCountry) {
+        scored.push({ country: contextCountry, score: 70 });
+      }
+
+      const elementId = String(el.getAttribute("id") || "").trim();
+      if (!elementId) continue;
+      const labelSelector = typeof CSS === "object" && CSS && typeof CSS.escape === "function"
+        ? `label[for="${CSS.escape(elementId)}"]`
+        : null;
+      if (!labelSelector) continue;
+
+      for (const label of Array.from(document.querySelectorAll(labelSelector))) {
+        if (isDroqsdbUiNode(label) || !isVisible(label)) continue;
+        const labelCountry = scoreCountryFromNodeContext(label, 90, 2);
+        if (!labelCountry) continue;
+        scored.push({ country: labelCountry, score: 90 });
+      }
+    }
+
+    return pickBestCountryFromScores(scored);
   }
 
   function getSelectedDestinationFromMarkers(candidates = collectVisibleCountryLabelNodes()) {
@@ -2835,26 +3489,61 @@
 
   function getSelectedDestinationFromActionContext() {
     const actionButtons = collectVisibleTravelActionButtons();
-    if (actionButtons.length !== 1) return null;
+    const scored = [];
 
-    let node = actionButtons[0];
-    let depth = 0;
+    for (const button of actionButtons) {
+      let node = button;
+      let depth = 0;
 
-    while (node && depth < 6) {
-      const text = getElementText(node);
-      if (text && text.length <= 600) {
-        const countries = findCountriesInText(text);
-        if (countries.length === 1) return countries[0];
+      while (node && depth < 6) {
+        for (const text of getCountryDetectionTexts(node)) {
+          if (!text || text.length > 240) continue;
+          const countries = findCountriesInText(text);
+          if (countries.length !== 1) continue;
+          scored.push({
+            country: countries[0],
+            score: Math.max(1, 70 - (depth * 10)),
+          });
+        }
+        node = node.parentElement;
+        depth += 1;
       }
-      node = node.parentElement;
-      depth += 1;
     }
 
-    return null;
+    return pickBestCountryFromScores(scored);
+  }
+
+  function getSelectedDestinationFromSummaryContext() {
+    const scored = [];
+    const nodes = Array.from(document.querySelectorAll("button,a,label,span,div,p,strong,b,h1,h2,h3,h4,h5,h6,li"));
+
+    for (const el of nodes) {
+      if (isDroqsdbUiNode(el)) continue;
+      if (!isVisible(el)) continue;
+
+      for (const text of getCountryDetectionTexts(el)) {
+        if (!text || text.length > 180) continue;
+        if (!/\b(?:destination|travel(?:ing|ling)?\s+to|fly(?:ing)?\s+to|depart(?:ure)?\s+to|headed\s+to|going\s+to|selected)\b/i.test(text)) {
+          continue;
+        }
+        const countries = findCountriesInText(text);
+        if (countries.length !== 1) continue;
+        scored.push({
+          country: countries[0],
+          score: 85,
+        });
+      }
+    }
+
+    return pickBestCountryFromScores(scored);
   }
 
   function getSelectedTravelDestinationCountry(candidates = collectVisibleCountryLabelNodes()) {
-    return getSelectedDestinationFromMarkers(candidates) || getSelectedDestinationFromActionContext() || null;
+    return getSelectedDestinationFromCheckedInputs() ||
+      getSelectedDestinationFromMarkers(candidates) ||
+      getSelectedDestinationFromActionContext() ||
+      getSelectedDestinationFromSummaryContext() ||
+      null;
   }
 
   function setTravelPlannerSelectedCountry(country, reason = "selection-confirmed") {
@@ -2908,6 +3597,7 @@
     }
 
     if (detectedSelectedCountry) {
+      travelPlannerSelectionState.lastEligibleAt = Date.now();
       return setTravelPlannerSelectedCountry(detectedSelectedCountry);
     }
 
@@ -2918,7 +3608,14 @@
     }
 
     if (!travelAgency) {
-      return stickyCountry;
+      if (
+        travelPlannerSelectionState.lastEligibleAt > 0 &&
+        (Date.now() - travelPlannerSelectionState.lastEligibleAt) <= TRAVEL_PLANNER_LAYOUT_GRACE_MS
+      ) {
+        return stickyCountry;
+      }
+      resetTravelPlannerSelectedCountry("left-eligible-travel-selection-state");
+      return null;
     }
 
     const clearlyDeselected = hasTravelDestinationPrompt(pageText) && countryOptionCount >= 2;
@@ -3046,6 +3743,11 @@
       settings.filters.countries.join(","),
       settings.filters.categories.join(","),
       settings.filters.itemNames.join(","),
+      getTravelPlannerGeneralResultsCount(settings),
+      TRAVEL_PLANNER_SPECIAL_CATEGORY_OPTIONS
+        .map((option) => isTravelPlannerCategoryGroupEnabled(settings, option.value) ? option.value : "")
+        .filter(Boolean)
+        .join(","),
     ].join("|");
   }
 
@@ -3092,23 +3794,23 @@
     }, delayMs);
   }
 
-  function resetCompanionCountryResult(target, { status = "hidden", country = null } = {}) {
+  function resetCompanionResultState(target, { status = "hidden", country = null } = {}) {
     target.status = status;
-    target.country = country;
+    if (Object.prototype.hasOwnProperty.call(target, "country")) target.country = country;
     target.payload = null;
+    target.runs = [];
     target.emptyReason = null;
   }
 
-  function resetCompanionPanelState(context) {
+  function resetCompanionPanelState(context, settings) {
     companionPanelState.context = context;
-    companionPanelState.global.status = "idle";
-    companionPanelState.global.payload = null;
-    companionPanelState.global.emptyReason = null;
-    resetCompanionCountryResult(companionPanelState.selected);
-    resetCompanionCountryResult(companionPanelState.countryHelper);
+    resetCompanionResultState(companionPanelState.global, { status: "idle" });
+    resetCompanionResultState(companionPanelState.selected);
+    resetCompanionResultState(companionPanelState.countryHelper);
+    companionPanelState.categoryGroups = [];
 
     if (context.mode === "country-helper") {
-      resetCompanionCountryResult(companionPanelState.countryHelper, {
+      resetCompanionResultState(companionPanelState.countryHelper, {
         status: "loading",
         country: context.country,
       });
@@ -3116,8 +3818,11 @@
     }
 
     companionPanelState.global.status = "loading";
+    companionPanelState.categoryGroups = getTravelPlannerCategoryGroupConfigs(settings)
+      .map((group) => createTravelPlannerCategoryGroupState(group, "queued"));
+
     if (context.selectedCountry) {
-      resetCompanionCountryResult(companionPanelState.selected, {
+      resetCompanionResultState(companionPanelState.selected, {
         status: "loading",
         country: context.selectedCountry,
       });
@@ -3127,6 +3832,10 @@
   function invalidateCompanionPanelSignature() {
     companionPanelState.signature = null;
     companionPanelState.requestToken += 1;
+  }
+
+  function isActiveCompanionPanelRequest(requestToken, signature) {
+    return requestToken === companionPanelState.requestToken && companionPanelState.signature === signature;
   }
 
   async function refreshCompanionPanelForCurrentState() {
@@ -3146,7 +3855,7 @@
     companionPanelState.signature = signature;
     companionPanelState.requestToken += 1;
     const requestToken = companionPanelState.requestToken;
-    resetCompanionPanelState(context);
+    resetCompanionPanelState(context, settings);
     ensureCompanionPanel();
     renderCompanionPanel();
 
@@ -3155,37 +3864,64 @@
         COMPANION_COUNTRY_HELPER_API_URL,
         buildCountryHelperQueryBody(settings, context.country)
       );
-      if (requestToken !== companionPanelState.requestToken || companionPanelState.signature !== signature) return;
+      if (!isActiveCompanionPanelRequest(requestToken, signature)) return;
       applyCountryHelperPayload(context.country, countryPayload, companionPanelState.countryHelper);
       renderCompanionPanel();
       return;
     }
 
-    const [globalPayload, selectedPayload] = await Promise.all([
-      safePostCompanionJson(COMPANION_TRAVEL_PLANNER_API_URL, buildTravelPlannerQueryBody(settings)),
-      context.selectedCountry
-        ? safePostCompanionJson(
-            COMPANION_COUNTRY_HELPER_API_URL,
-            buildCountryHelperQueryBody(settings, context.selectedCountry)
-          )
-        : Promise.resolve(null),
-    ]);
-
-    if (requestToken !== companionPanelState.requestToken || companionPanelState.signature !== signature) return;
+    const categoryGroups = getTravelPlannerCategoryGroupConfigs(settings);
+    const requestedLimit = getTravelPlannerResultsLimit(settings);
+    const globalPayload = await safePostCompanionJson(
+      COMPANION_TRAVEL_PLANNER_API_URL,
+      buildTravelPlannerQueryBody(settings, { limit: requestedLimit })
+    );
+    if (!isActiveCompanionPanelRequest(requestToken, signature)) return;
 
     applyTravelPlannerPayload(globalPayload);
+    renderCompanionPanel();
+
     if (context.selectedCountry) {
+      const selectedPayload = await safePostCompanionJson(
+        COMPANION_COUNTRY_HELPER_API_URL,
+        buildCountryHelperQueryBody(settings, context.selectedCountry, { limit: requestedLimit })
+      );
+      if (!isActiveCompanionPanelRequest(requestToken, signature)) return;
       applyCountryHelperPayload(context.selectedCountry, selectedPayload);
+      renderCompanionPanel();
     } else {
-      resetCompanionCountryResult(companionPanelState.selected);
+      resetCompanionResultState(companionPanelState.selected);
     }
 
+    if (!categoryGroups.length) return;
+
+    companionPanelState.categoryGroups.forEach((group) => {
+      if (group?.status === "queued") {
+        group.status = "loading";
+      }
+    });
     renderCompanionPanel();
+
+    const categoryTasks = categoryGroups.map((group, index) => (async () => {
+      const categoryPayload = await safePostCompanionJson(
+        COMPANION_TRAVEL_PLANNER_API_URL,
+        buildTravelPlannerQueryBody(settings, {
+          limit: requestedLimit,
+          categories: [group.value],
+        })
+      );
+      if (!isActiveCompanionPanelRequest(requestToken, signature)) return;
+      applyTravelPlannerPayload(categoryPayload, companionPanelState.categoryGroups[index]);
+      renderCompanionPanel();
+    })());
+
+    await Promise.all(categoryTasks);
   }
 
   function scheduleCompanionPanelRefreshAfterUpload(pageStateKey, country) {
     if (!country || !pageStateKey) return;
     if (getPageStateKey(country) !== pageStateKey) return;
+    clearCompanionResponseCache();
     invalidateCompanionPanelSignature();
     scheduleCompanionStateCheck(0);
   }
