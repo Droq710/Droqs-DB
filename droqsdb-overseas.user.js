@@ -53,9 +53,15 @@
     { value: "drugs", label: "Drugs" },
   ]);
   const SETTINGS_SELL_WHERE_OPTIONS = Object.freeze([
-    { value: "market", label: "Market" },
-    { value: "torn", label: "Torn" },
+    { value: "market", label: "Item Market" },
+    { value: "bazaar", label: "Bazaar" },
+    { value: "torn", label: "Torn City Shops" },
   ]);
+  const COMPANION_SELL_VALUE_LABELS = Object.freeze({
+    market: "Item Market Value",
+    bazaar: "Bazaar Value",
+    torn: "Torn City Shops",
+  });
   const SETTINGS_FLIGHT_TYPE_OPTIONS = Object.freeze([
     { value: "standard", label: "Standard" },
     { value: "airstrip", label: "Airstrip" },
@@ -97,6 +103,14 @@
   const LEGACY_BADGE_POSITION_STORAGE_KEY = "droqsdb:overseas-badge-position:v1";
   const SETTINGS_SCHEMA_VERSION = 1;
   const UI_STATE_SCHEMA_VERSION = 1;
+
+  function normalizeSellWhereSetting(value, fallback = "market") {
+    return normalizeEnumString(
+      value,
+      SETTINGS_SELL_WHERE_OPTIONS.map((option) => option.value),
+      fallback
+    );
+  }
 
   function createDefaultTravelPlannerCategoryGroups() {
     return {
@@ -275,11 +289,7 @@
         categoryGroups: migratedCategoryGroups,
       },
       profit: {
-        sellWhere: normalizeEnumString(
-          profit.sellWhere,
-          SETTINGS_SELL_WHERE_OPTIONS.map((option) => option.value),
-          defaults.profit.sellWhere
-        ),
+        sellWhere: normalizeSellWhereSetting(profit.sellWhere, defaults.profit.sellWhere),
         applyTax: normalizeBoolean(profit.applyTax, defaults.profit.applyTax),
         flightType: normalizeEnumString(
           profit.flightType,
@@ -1370,7 +1380,7 @@
       options: modalOptions.sellWhereOptions,
       onChange: (event) => {
         commitSettingsChange((next) => {
-          next.profit.sellWhere = String(event.target.value || "").trim().toLowerCase() === "torn" ? "torn" : "market";
+          next.profit.sellWhere = normalizeSellWhereSetting(event.target.value, next.profit.sellWhere);
         });
       },
     }));
@@ -2270,7 +2280,7 @@
     return el;
   }
 
-  function createCompanionStat(label, value) {
+  function createCompanionStat(label, value, { mutedValue = false, valueTitle = "" } = {}) {
     const cell = document.createElement("div");
     cell.style.minWidth = "0";
 
@@ -2285,9 +2295,10 @@
     const valueEl = createCompanionTextBlock(value, {
       fontSize: "12px",
       lineHeight: "1.35",
-      color: "#fff",
+      color: mutedValue ? "rgba(255,255,255,0.62)" : "#fff",
       wordBreak: "break-word",
     });
+    if (valueTitle) valueEl.title = valueTitle;
 
     cell.appendChild(labelEl);
     cell.appendChild(valueEl);
@@ -2313,6 +2324,11 @@
     showRunCost = false,
     hideMissingStock = false,
   } = {}) {
+    const settings = getSettings();
+    const sellPriceMeta = getCompanionSelectedSellPriceMeta(entry, settings);
+    const profitPerItemMeta = getCompanionMetricValueMeta(entry?.profitPerItem, entry, settings);
+    const profitPerMinuteMeta = getCompanionMetricValueMeta(entry?.profitPerMinute, entry, settings);
+
     if (!hideMissingStock || Number.isFinite(Number(entry?.stock))) {
       statsGrid.appendChild(createCompanionStat("Stock", formatCompanionNumber(entry?.stock)));
     }
@@ -2322,8 +2338,21 @@
     if (showRunCost) {
       statsGrid.appendChild(createCompanionStat("Run Cost", formatCompanionNumber(entry?.runCost, { currency: true })));
     }
-    statsGrid.appendChild(createCompanionStat("Profit / Item", formatCompanionNumber(entry?.profitPerItem, { currency: true })));
-    statsGrid.appendChild(createCompanionStat("Profit / Min", formatCompanionNumber(entry?.profitPerMinute, { currency: true })));
+    statsGrid.appendChild(createCompanionStat(
+      getCompanionSellValueLabel(settings),
+      sellPriceMeta.text,
+      { mutedValue: sellPriceMeta.muted, valueTitle: sellPriceMeta.title }
+    ));
+    statsGrid.appendChild(createCompanionStat(
+      "Profit / Item",
+      profitPerItemMeta.text,
+      { mutedValue: profitPerItemMeta.muted, valueTitle: profitPerItemMeta.title }
+    ));
+    statsGrid.appendChild(createCompanionStat(
+      "Profit / Min",
+      profitPerMinuteMeta.text,
+      { mutedValue: profitPerMinuteMeta.muted, valueTitle: profitPerMinuteMeta.title }
+    ));
   }
 
   function getTravelPlannerCategoryGroupConfigs(settings = getSettings()) {
@@ -2340,6 +2369,7 @@
   }
 
   function formatCompanionNumber(value, { currency = false } = {}) {
+    if (value === null || value === undefined || value === "") return "—";
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) return "—";
     const maximumFractionDigits = Number.isInteger(numeric) ? 0 : (Math.abs(numeric) < 10 ? 2 : 1);
@@ -2348,6 +2378,67 @@
       maximumFractionDigits,
     }).format(numeric);
     return currency ? `$${formatted}` : formatted;
+  }
+
+  function getCompanionFiniteNumber(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+
+  function getCompanionSelectedSellWhere(settings = getSettings()) {
+    return normalizeSellWhereSetting(settings?.profit?.sellWhere);
+  }
+
+  function getCompanionSellValueLabel(settings = getSettings()) {
+    const sellWhere = getCompanionSelectedSellWhere(settings);
+    return COMPANION_SELL_VALUE_LABELS[sellWhere] || COMPANION_SELL_VALUE_LABELS.market;
+  }
+
+  function getCompanionSelectedSellPrice(entry, settings = getSettings()) {
+    const sellWhere = getCompanionSelectedSellWhere(settings);
+    if (sellWhere === "torn") return getCompanionFiniteNumber(entry?.tornCityShops);
+    if (sellWhere === "bazaar") return getCompanionFiniteNumber(entry?.bazaarPrice);
+    return getCompanionFiniteNumber(entry?.marketValue);
+  }
+
+  function getCompanionBazaarUnavailableTitle(entry, settings = getSettings()) {
+    if (getCompanionSelectedSellWhere(settings) !== "bazaar") return "";
+    if (getCompanionFiniteNumber(entry?.bazaarPrice) !== null) return "";
+    return "Bazaar price unavailable. No valid listings above $1 were found, $1-only listings were ignored, or bazaar data is temporarily unavailable.";
+  }
+
+  function getCompanionUnavailableValueMeta(entry, settings = getSettings()) {
+    const title = getCompanionBazaarUnavailableTitle(entry, settings);
+    return {
+      text: title ? "Unavailable" : "—",
+      muted: true,
+      title,
+    };
+  }
+
+  function getCompanionSelectedSellPriceMeta(entry, settings = getSettings()) {
+    const numeric = getCompanionSelectedSellPrice(entry, settings);
+    if (numeric !== null) {
+      return {
+        text: formatCompanionNumber(numeric, { currency: true }),
+        muted: false,
+        title: "",
+      };
+    }
+    return getCompanionUnavailableValueMeta(entry, settings);
+  }
+
+  function getCompanionMetricValueMeta(value, entry, settings = getSettings()) {
+    const numeric = getCompanionFiniteNumber(value);
+    if (numeric !== null) {
+      return {
+        text: formatCompanionNumber(numeric, { currency: true }),
+        muted: false,
+        title: "",
+      };
+    }
+    return getCompanionUnavailableValueMeta(entry, settings);
   }
 
   function formatCompanionSource(source) {
@@ -2383,26 +2474,56 @@
     return parts.join(" · ");
   }
 
-  function getTravelPlannerEmptyMessage(emptyReason) {
-    if (emptyReason === "FILTERS_EXCLUDED_ALL_RESULTS") return "No qualifying run matches your saved filters.";
-    if (emptyReason === "NO_QUALIFIED_RUNS") return "No arrival-safe run qualifies right now.";
-    return "No profitable run is available right now.";
+  function getTravelPlannerEmptyMessage(emptyReason, settings = getSettings()) {
+    const bazaarSelected = getCompanionSelectedSellWhere(settings) === "bazaar";
+    if (emptyReason === "FILTERS_EXCLUDED_ALL_RESULTS") {
+      return bazaarSelected
+        ? "No Bazaar-priced qualifying run matches your saved filters."
+        : "No qualifying run matches your saved filters.";
+    }
+    if (emptyReason === "NO_QUALIFIED_RUNS") {
+      return bazaarSelected
+        ? "No arrival-safe Bazaar run qualifies right now."
+        : "No arrival-safe run qualifies right now.";
+    }
+    return bazaarSelected
+      ? "No profitable run with Bazaar pricing is available right now."
+      : "No profitable run is available right now.";
   }
 
-  function getSelectedCountryEmptyMessage(emptyReason) {
-    if (emptyReason === "FILTERS_EXCLUDED_ALL_RESULTS") return "No qualifying items in this country match your saved filters.";
-    return "No profitable items currently estimated to be in stock on arrival.";
+  function getSelectedCountryEmptyMessage(emptyReason, settings = getSettings()) {
+    const bazaarSelected = getCompanionSelectedSellWhere(settings) === "bazaar";
+    if (emptyReason === "FILTERS_EXCLUDED_ALL_RESULTS") {
+      return bazaarSelected
+        ? "No Bazaar-priced items in this country match your saved filters."
+        : "No qualifying items in this country match your saved filters.";
+    }
+    return bazaarSelected
+      ? "No profitable Bazaar-priced items are currently estimated to be in stock on arrival."
+      : "No profitable items currently estimated to be in stock on arrival.";
   }
 
-  function getCountryHelperEmptyMessage(country, emptyReason) {
-    if (emptyReason === "FILTERS_EXCLUDED_ALL_RESULTS") return "No qualifying item matches your saved filters.";
-    if (emptyReason === "NO_PROFITABLE_ITEMS") return `No profitable in-stock item is available in ${country}.`;
+  function getCountryHelperEmptyMessage(country, emptyReason, settings = getSettings()) {
+    const bazaarSelected = getCompanionSelectedSellWhere(settings) === "bazaar";
+    if (emptyReason === "FILTERS_EXCLUDED_ALL_RESULTS") {
+      return bazaarSelected
+        ? "No Bazaar-priced qualifying item matches your saved filters."
+        : "No qualifying item matches your saved filters.";
+    }
+    if (emptyReason === "NO_PROFITABLE_ITEMS") {
+      return bazaarSelected
+        ? `No profitable in-stock Bazaar item is available in ${country}.`
+        : `No profitable in-stock item is available in ${country}.`;
+    }
     if (emptyReason === "NO_IN_STOCK_ITEMS") return `No in-stock items are available in ${country}.`;
-    return `No qualifying item is available in ${country}.`;
+    return bazaarSelected
+      ? `No qualifying Bazaar item is available in ${country}.`
+      : `No qualifying item is available in ${country}.`;
   }
 
-  function getTravelPlannerCategoryGroupsEmptyMessage(groups) {
+  function getTravelPlannerCategoryGroupsEmptyMessage(groups, settings = getSettings()) {
     const categoryGroups = Array.isArray(groups) ? groups : [];
+    const bazaarSelected = getCompanionSelectedSellWhere(settings) === "bazaar";
     if (categoryGroups.some((group) => group?.status === "unavailable")) {
       return "Selected category groups are unavailable right now.";
     }
@@ -2412,12 +2533,18 @@
       .filter(Boolean);
 
     if (emptyReasons.length && emptyReasons.every((reason) => reason === "FILTERS_EXCLUDED_ALL_RESULTS")) {
-      return "No selected category group matches your saved filters.";
+      return bazaarSelected
+        ? "No Bazaar-priced selected category group matches your saved filters."
+        : "No selected category group matches your saved filters.";
     }
     if (emptyReasons.length && emptyReasons.every((reason) => reason === "NO_QUALIFIED_RUNS")) {
-      return "No arrival-safe run qualifies in the selected category groups right now.";
+      return bazaarSelected
+        ? "No arrival-safe Bazaar run qualifies in the selected category groups right now."
+        : "No arrival-safe run qualifies in the selected category groups right now.";
     }
-    return "No profitable run is available in the selected category groups right now.";
+    return bazaarSelected
+      ? "No profitable Bazaar-priced run is available in the selected category groups right now."
+      : "No profitable run is available in the selected category groups right now.";
   }
 
   function buildCompanionResultEntryCard(entry, {
