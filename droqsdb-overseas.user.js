@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DroqsDB Overseas Stock Reporter
 // @namespace    https://droqsdb.com/
-// @version      1.6.8
+// @version      1.6.9
 // @description  Collects overseas shop stock+prices and uploads to droqsdb.com (Desktop + TornPDA iOS fallback)
 // @author       Droq
 // @match        https://www.torn.com/page.php?sid=travel*
@@ -17,7 +17,7 @@
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "1.6.8";
+  const SCRIPT_VERSION = "1.6.9";
   const API_URL = "https://droqsdb.com/api/report-stock";
   const COMPANION_TRAVEL_PLANNER_API_URL = "https://droqsdb.com/api/companion/v1/travel-planner/query";
   const COMPANION_COUNTRY_HELPER_API_URL = "https://droqsdb.com/api/companion/v1/country-helper/query";
@@ -490,6 +490,7 @@
       payload: null,
       runs: [],
       emptyReason: null,
+      emptyStateGuidance: null,
     },
     selected: {
       status: "hidden",
@@ -2386,6 +2387,105 @@
     return Number.isFinite(numeric) ? numeric : null;
   }
 
+  function formatCompanionEtaMinutes(value) {
+    const minutes = getCompanionFiniteNumber(value);
+    if (minutes === null || minutes < 0) return null;
+    const rounded = Math.max(0, Math.round(minutes));
+    if (rounded < 60) return `~${rounded}m`;
+    const hours = Math.floor(rounded / 60);
+    const remainder = rounded % 60;
+    return remainder ? `~${hours}h ${remainder}m` : `~${hours}h`;
+  }
+
+  function formatCompanionCompactDuration(value) {
+    const minutes = getCompanionFiniteNumber(value);
+    if (minutes === null || minutes < 0) return null;
+    const rounded = Math.max(0, Math.round(minutes));
+    if (!rounded) return "0m";
+    if (rounded < 60) return `${rounded}m`;
+    const hours = Math.floor(rounded / 60);
+    const remainder = rounded % 60;
+    return remainder ? `${hours}h ${remainder}m` : `${hours}h`;
+  }
+
+  function formatCompanionUtcClockTime(value) {
+    const date = value instanceof Date ? value : new Date(value);
+    if (!Number.isFinite(date.getTime())) return null;
+    const hours = String(date.getUTCHours()).padStart(2, "0");
+    const minutes = String(date.getUTCMinutes()).padStart(2, "0");
+    return `${hours}:${minutes} TCT`;
+  }
+
+  function normalizeTravelPlannerEmptyStateGuidance(guidance) {
+    const kind = String(guidance?.kind || "").trim();
+    if (!["next_run", "timing_unreliable", "no_viable_runs"].includes(kind)) return null;
+
+    return {
+      kind,
+      itemName: String(guidance?.itemName || "").trim() || null,
+      country: String(guidance?.country || "").trim() || null,
+      runKind: String(guidance?.runKind || "").trim() || null,
+      departureMinutes: getCompanionFiniteNumber(guidance?.departureMinutes),
+      departureAt: guidance?.departureAt || null,
+      arrivalAt: guidance?.arrivalAt || null,
+      restockAt: guidance?.restockAt || null,
+      stockoutAt: guidance?.stockoutAt || null,
+      viableWindowDurationMinutes: getCompanionFiniteNumber(guidance?.viableWindowDurationMinutes),
+      arrivalBufferMinutes: getCompanionFiniteNumber(guidance?.arrivalBufferMinutes),
+      tightWindow: guidance?.tightWindow === true,
+    };
+  }
+
+  function getTravelPlannerGuidanceDepartureText(guidance) {
+    const departureAtMs = guidance?.departureAt ? new Date(guidance.departureAt).getTime() : NaN;
+    if (Number.isFinite(departureAtMs)) {
+      const minutes = Math.max(0, Math.round((departureAtMs - Date.now()) / 60000));
+      return minutes ? `in ${formatCompanionCompactDuration(minutes)}` : "now";
+    }
+
+    const fallbackMinutes = getCompanionFiniteNumber(guidance?.departureMinutes);
+    if (fallbackMinutes === null || fallbackMinutes < 0) return null;
+    const rounded = Math.max(0, Math.round(fallbackMinutes));
+    return rounded ? `in ${formatCompanionCompactDuration(rounded)}` : "now";
+  }
+
+  function getTravelPlannerGuidanceMessage(guidance) {
+    if (!guidance) return null;
+
+    if (guidance.kind === "next_run") {
+      const routeText = guidance.itemName && guidance.country
+        ? `${guidance.itemName} in ${guidance.country}`
+        : guidance.itemName || guidance.country || null;
+      const departureText = getTravelPlannerGuidanceDepartureText(guidance);
+      const departureClock = formatCompanionUtcClockTime(guidance.departureAt);
+      const windowText = formatCompanionEtaMinutes(guidance.viableWindowDurationMinutes);
+      const parts = ["No runs currently available."];
+
+      if (routeText) parts.push(`Next best: ${routeText}.`);
+      if (departureText && departureClock) {
+        parts.push(`Depart ${departureText} at ${departureClock}.`);
+      } else if (departureText) {
+        parts.push(`Depart ${departureText}.`);
+      } else if (departureClock) {
+        parts.push(`Depart at ${departureClock}.`);
+      }
+      if (windowText) parts.push(`Window: ${windowText}.`);
+      if (guidance.tightWindow) parts.push("Tight timing window.");
+
+      return parts.join(" ");
+    }
+
+    if (guidance.kind === "timing_unreliable") {
+      return "No runs currently available. Upcoming restocks are too inconsistent to reliably predict a profitable departure window.";
+    }
+
+    if (guidance.kind === "no_viable_runs") {
+      return "No runs currently available under your current filters and settings.";
+    }
+
+    return null;
+  }
+
   function getCompanionSelectedSellWhere(settings = getSettings()) {
     return normalizeSellWhereSetting(settings?.profit?.sellWhere);
   }
@@ -2474,7 +2574,10 @@
     return parts.join(" · ");
   }
 
-  function getTravelPlannerEmptyMessage(emptyReason, settings = getSettings()) {
+  function getTravelPlannerEmptyMessage(emptyReason, guidance = null, settings = getSettings()) {
+    const guidanceMessage = getTravelPlannerGuidanceMessage(guidance);
+    if (guidanceMessage) return guidanceMessage;
+
     const bazaarSelected = getCompanionSelectedSellWhere(settings) === "bazaar";
     if (emptyReason === "FILTERS_EXCLUDED_ALL_RESULTS") {
       return bazaarSelected
@@ -2898,7 +3001,10 @@
         title: "Top Runs Right Now",
         status: companionPanelState.global.status === "hidden" ? "loading" : companionPanelState.global.status,
         entries: companionPanelState.global.runs,
-        emptyText: getTravelPlannerEmptyMessage(companionPanelState.global.emptyReason),
+        emptyText: getTravelPlannerEmptyMessage(
+          companionPanelState.global.emptyReason,
+          companionPanelState.global.emptyStateGuidance
+        ),
         showCountryMeta: true,
         showRunCost: settings.showRunCost,
         showArrivalStockNote: true,
@@ -2909,7 +3015,10 @@
         title: "Best Run Right Now",
         status: companionPanelState.global.status === "hidden" ? "loading" : companionPanelState.global.status,
         entry: companionPanelState.global.payload,
-        emptyText: getTravelPlannerEmptyMessage(companionPanelState.global.emptyReason),
+        emptyText: getTravelPlannerEmptyMessage(
+          companionPanelState.global.emptyReason,
+          companionPanelState.global.emptyStateGuidance
+        ),
         showCountryMeta: true,
         showRunCost: settings.showRunCost,
         showArrivalStockNote: true,
@@ -2921,6 +3030,7 @@
     if (categoryGroups.length) {
       const visibleGroups = categoryGroups.filter((group) => {
         if (group?.status === "ready") return Array.isArray(group.runs) && group.runs.length > 0;
+        if (group?.status === "empty") return Boolean(group?.emptyStateGuidance);
         return group?.status === "unavailable";
       });
       const hasPendingCategoryGroups = categoryGroups.some((group) => group?.status === "queued" || group?.status === "loading");
@@ -2961,7 +3071,7 @@
           title: group.label,
           status: group.status,
           entries: group.runs,
-          emptyText: getTravelPlannerEmptyMessage(group.emptyReason),
+          emptyText: getTravelPlannerEmptyMessage(group.emptyReason, group.emptyStateGuidance),
           showCountryMeta: true,
           showCategoryMeta: false,
           showRunCost: settings.showRunCost,
@@ -3226,6 +3336,7 @@
       payload: null,
       runs: [],
       emptyReason: null,
+      emptyStateGuidance: null,
     };
   }
 
@@ -3235,6 +3346,7 @@
       target.payload = null;
       target.runs = [];
       target.emptyReason = null;
+      target.emptyStateGuidance = null;
       return;
     }
 
@@ -3244,7 +3356,9 @@
     target.payload = runs[0] || payload.bestRun || null;
     target.runs = runs;
     target.emptyReason = String(payload.emptyReason || "").trim() || null;
+    target.emptyStateGuidance = normalizeTravelPlannerEmptyStateGuidance(payload.emptyStateGuidance);
     target.status = target.payload ? "ready" : "empty";
+    if (target.status === "ready") target.emptyStateGuidance = null;
   }
 
   function applyCountryHelperPayload(country, payload, target = companionPanelState.selected) {
@@ -3927,6 +4041,7 @@
     target.payload = null;
     target.runs = [];
     target.emptyReason = null;
+    if (Object.prototype.hasOwnProperty.call(target, "emptyStateGuidance")) target.emptyStateGuidance = null;
   }
 
   function resetCompanionPanelState(context, settings) {
