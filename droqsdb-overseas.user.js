@@ -456,6 +456,7 @@
   let companionStateObserver = null;
   let companionStateTimer = null;
   let companionInteractionTimer = null;
+  let companionGuidanceTimer = null;
   const companionDebugSignatures = {
     planner: null,
     helper: null,
@@ -2424,6 +2425,8 @@
       kind,
       itemName: String(guidance?.itemName || "").trim() || null,
       country: String(guidance?.country || "").trim() || null,
+      reasonCode: String(guidance?.reasonCode || "").trim() || null,
+      message: String(guidance?.message || "").trim() || null,
       runKind: String(guidance?.runKind || "").trim() || null,
       departureMinutes: getCompanionFiniteNumber(guidance?.departureMinutes),
       departureAt: guidance?.departureAt || null,
@@ -2476,7 +2479,9 @@
     }
 
     if (guidance.kind === "timing_unreliable") {
-      return "No runs currently available. Upcoming restocks are too inconsistent to reliably predict a profitable departure window.";
+      return guidance.message
+        ? `No runs currently available. ${guidance.message}`
+        : "No runs currently available. Upcoming restocks are too inconsistent to reliably predict a profitable departure window.";
     }
 
     if (guidance.kind === "no_viable_runs") {
@@ -3116,6 +3121,7 @@
   function renderCompanionPanel() {
     if (!companionPanelContentEl) return;
 
+    clearCompanionGuidanceTimer();
     const settings = getSettings();
     applyCompanionPanelChrome(companionPanelState.context);
     companionPanelContentEl.textContent = "";
@@ -3125,7 +3131,63 @@
     }
     if (companionPanelState.context.mode === "planner") {
       renderTravelPlannerPanelContent(settings);
+      scheduleCompanionGuidanceRefresh();
     }
+  }
+
+  function clearCompanionGuidanceTimer() {
+    if (!companionGuidanceTimer) return;
+    clearTimeout(companionGuidanceTimer);
+    companionGuidanceTimer = null;
+  }
+
+  function getActiveTravelPlannerGuidances() {
+    if (companionPanelState.context.mode !== "planner") return [];
+
+    const guidances = [];
+    const globalGuidance = companionPanelState.global?.emptyStateGuidance || null;
+    if (globalGuidance?.kind === "next_run") guidances.push(globalGuidance);
+
+    for (const group of (Array.isArray(companionPanelState.categoryGroups) ? companionPanelState.categoryGroups : [])) {
+      const guidance = group?.emptyStateGuidance || null;
+      if (guidance?.kind === "next_run") guidances.push(guidance);
+    }
+
+    return guidances;
+  }
+
+  function scheduleCompanionGuidanceRefresh() {
+    clearCompanionGuidanceTimer();
+
+    const guidances = getActiveTravelPlannerGuidances();
+    if (!guidances.length) return;
+
+    const nowMs = Date.now();
+    const hasExpiredDeparture = guidances.some((guidance) => {
+      const departureAtMs = guidance?.departureAt ? new Date(guidance.departureAt).getTime() : NaN;
+      return Number.isFinite(departureAtMs) && departureAtMs <= nowMs;
+    });
+
+    if (hasExpiredDeparture) {
+      clearCompanionResponseCache();
+      invalidateCompanionPanelSignature();
+      scheduleCompanionStateCheck(0);
+      return;
+    }
+
+    const minuteBoundaryDelay = Math.max(1000, Math.min(60000, (60000 - (nowMs % 60000)) + 250));
+    const nextDepartureDelay = guidances
+      .map((guidance) => guidance?.departureAt ? new Date(guidance.departureAt).getTime() : NaN)
+      .filter((value) => Number.isFinite(value) && value > nowMs)
+      .map((value) => Math.max(1000, value - nowMs + 1000))
+      .sort((a, b) => a - b)[0] || null;
+    const delayMs = nextDepartureDelay === null ? minuteBoundaryDelay : Math.min(minuteBoundaryDelay, nextDepartureDelay);
+
+    companionGuidanceTimer = setTimeout(() => {
+      companionGuidanceTimer = null;
+      if (companionPanelState.context.mode !== "planner") return;
+      renderCompanionPanel();
+    }, delayMs);
   }
 
   function buildCompanionRequestSettings(settings) {
@@ -4087,6 +4149,7 @@
     syncCompanionPanelVisibility(context);
 
     if (!context.eligible) {
+      clearCompanionGuidanceTimer();
       companionPanelState.signature = null;
       return;
     }
