@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DroqsDB Overseas Stock Reporter
 // @namespace    https://droqsdb.com/
-// @version      1.6.9
+// @version      1.6.10
 // @description  Collects overseas shop stock+prices and uploads to droqsdb.com (Desktop + TornPDA iOS fallback)
 // @author       Droq
 // @match        https://www.torn.com/page.php?sid=travel*
@@ -17,7 +17,7 @@
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "1.6.9";
+  const SCRIPT_VERSION = "1.6.10";
   const API_URL = "https://droqsdb.com/api/report-stock";
   const COMPANION_TRAVEL_PLANNER_API_URL = "https://droqsdb.com/api/companion/v1/travel-planner/query";
   const COMPANION_COUNTRY_HELPER_API_URL = "https://droqsdb.com/api/companion/v1/country-helper/query";
@@ -499,6 +499,7 @@
       payload: null,
       runs: [],
       emptyReason: null,
+      emptyStateGuidance: null,
     },
     countryHelper: {
       status: "idle",
@@ -2427,6 +2428,8 @@
       country: String(guidance?.country || "").trim() || null,
       reasonCode: String(guidance?.reasonCode || "").trim() || null,
       message: String(guidance?.message || "").trim() || null,
+      messageShort: String(guidance?.messageShort || "").trim() || null,
+      messageDetailed: String(guidance?.messageDetailed || "").trim() || null,
       runKind: String(guidance?.runKind || "").trim() || null,
       departureMinutes: getCompanionFiniteNumber(guidance?.departureMinutes),
       departureAt: guidance?.departureAt || null,
@@ -2454,6 +2457,8 @@
 
   function getTravelPlannerGuidanceMessage(guidance) {
     if (!guidance) return null;
+    if (guidance.messageDetailed) return guidance.messageDetailed;
+    if (guidance.messageShort) return guidance.messageShort;
 
     if (guidance.kind === "next_run") {
       const routeText = guidance.itemName && guidance.country
@@ -2597,18 +2602,6 @@
     return bazaarSelected
       ? "No profitable run with Bazaar pricing is available right now."
       : "No profitable run is available right now.";
-  }
-
-  function getSelectedCountryEmptyMessage(emptyReason, settings = getSettings()) {
-    const bazaarSelected = getCompanionSelectedSellWhere(settings) === "bazaar";
-    if (emptyReason === "FILTERS_EXCLUDED_ALL_RESULTS") {
-      return bazaarSelected
-        ? "No Bazaar-priced items in this country match your saved filters."
-        : "No qualifying items in this country match your saved filters.";
-    }
-    return bazaarSelected
-      ? "No profitable Bazaar-priced items are currently estimated to be in stock on arrival."
-      : "No profitable items currently estimated to be in stock on arrival.";
   }
 
   function getCountryHelperEmptyMessage(country, emptyReason, settings = getSettings()) {
@@ -2948,6 +2941,7 @@
     emptyText,
     showRunCost = false,
     resultsMode = "best",
+    showArrivalStockNote = false,
   }) {
     if (resultsMode === "top3") {
       return buildCompanionResultListSection({
@@ -2962,6 +2956,7 @@
         showRunCost,
         hideMissingStock: true,
         treatUnavailableAsEmpty: true,
+        showArrivalStockNote,
         loadingText: "Checking this country...",
       });
     }
@@ -2978,6 +2973,7 @@
       showRunCost,
       hideMissingStock: true,
       treatUnavailableAsEmpty: true,
+      showArrivalStockNote,
       loadingText: "Checking this country...",
     });
   }
@@ -3091,9 +3087,13 @@
         entry: companionPanelState.selected.payload,
         entries: companionPanelState.selected.runs,
         country: companionPanelState.selected.country,
-        emptyText: getSelectedCountryEmptyMessage(companionPanelState.selected.emptyReason),
+        emptyText: getTravelPlannerEmptyMessage(
+          companionPanelState.selected.emptyReason,
+          companionPanelState.selected.emptyStateGuidance
+        ),
         showRunCost: settings.showRunCost,
         resultsMode: generalResultsCount,
+        showArrivalStockNote: true,
       }));
     }
 
@@ -3201,8 +3201,12 @@
 
   function buildTravelPlannerQueryBody(settings, {
     limit = 1,
+    countries = null,
     categories = null,
   } = {}) {
+    const normalizedCountries = Array.isArray(countries)
+      ? normalizeStringArray(countries)
+      : normalizeStringArray(settings.filters.countries);
     const normalizedCategories = Array.isArray(categories)
       ? normalizeStringArray(categories).map((value) => value.toLowerCase())
       : normalizeStringArray(settings.filters.categories).map((value) => value.toLowerCase());
@@ -3211,7 +3215,7 @@
       settings: buildCompanionRequestSettings(settings),
       filters: {
         roundTripHours: settings.filters.roundTripHours,
-        countries: [...settings.filters.countries],
+        countries: normalizedCountries,
         categories: normalizedCategories,
         itemNames: [...settings.filters.itemNames],
       },
@@ -4188,11 +4192,15 @@
 
     if (context.selectedCountry) {
       const selectedPayload = await safePostCompanionJson(
-        COMPANION_COUNTRY_HELPER_API_URL,
-        buildCountryHelperQueryBody(settings, context.selectedCountry, { limit: requestedLimit })
+        COMPANION_TRAVEL_PLANNER_API_URL,
+        buildTravelPlannerQueryBody(settings, {
+          limit: requestedLimit,
+          countries: [context.selectedCountry],
+        })
       );
       if (!isActiveCompanionPanelRequest(requestToken, signature)) return;
-      applyCountryHelperPayload(context.selectedCountry, selectedPayload);
+      applyTravelPlannerPayload(selectedPayload, companionPanelState.selected);
+      companionPanelState.selected.country = context.selectedCountry;
       renderCompanionPanel();
     } else {
       resetCompanionResultState(companionPanelState.selected);
