@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DroqsDB Overseas Stock Reporter
 // @namespace    https://droqsdb.com/
-// @version      1.6.10
+// @version      1.6.11
 // @description  Collects overseas shop stock+prices and uploads to droqsdb.com (Desktop + TornPDA iOS fallback)
 // @author       Droq
 // @match        https://www.torn.com/page.php?sid=travel*
@@ -17,7 +17,7 @@
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "1.6.10";
+  const SCRIPT_VERSION = "1.6.11";
   const API_URL = "https://droqsdb.com/api/report-stock";
   const COMPANION_TRAVEL_PLANNER_API_URL = "https://droqsdb.com/api/companion/v1/travel-planner/query";
   const COMPANION_COUNTRY_HELPER_API_URL = "https://droqsdb.com/api/companion/v1/country-helper/query";
@@ -4667,7 +4667,7 @@
     return null;
   }
 
-  // ---------------- Scrape (STRICT desktop DOM — unchanged) ----------------
+  // ---------------- Scrape (strict desktop DOM) ----------------
   function getShopHeadersStrict() {
     // <h5 class="shopHeader___.">General Store</h5>
     return Array.from(document.querySelectorAll('h5[class*="shopHeader"]'))
@@ -4802,6 +4802,14 @@
     }
   }
 
+  function parseUploadResponseTextOrNull(text) {
+    try {
+      return parseUploadResponseText(text);
+    } catch {
+      return null;
+    }
+  }
+
   function requireConfirmedUpload(body) {
     if (!body || body.ok !== true) {
       throw new Error(String(body?.message || "Upload rejected"));
@@ -4836,13 +4844,14 @@
           data: payload,
           timeout: 20000,
           onload: (res) => {
+            const parsed = parseUploadResponseTextOrNull(res.responseText);
             if (res.status < 200 || res.status >= 300) {
-              reject(new Error(`HTTP ${res.status}`));
+              reject(new Error(parsed?.message || `HTTP ${res.status}`));
               return;
             }
 
             try {
-              resolve(requireConfirmedUpload(parseUploadResponseText(res.responseText)));
+              resolve(requireConfirmedUpload(parsed || parseUploadResponseText(res.responseText)));
             } catch (e) {
               reject(e);
             }
@@ -4861,8 +4870,12 @@
       credentials: "omit",
     });
 
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return requireConfirmedUpload(parseUploadResponseText(await res.text()));
+    const responseText = await res.text();
+    if (!res.ok) {
+      const parsed = parseUploadResponseTextOrNull(responseText);
+      throw new Error(parsed?.message || `HTTP ${res.status}`);
+    }
+    return requireConfirmedUpload(parseUploadResponseText(responseText));
   }
 
   // ---------------- Run loop ----------------
@@ -4893,7 +4906,7 @@
   function getPageStateKey(country) {
     if (!country) return null;
 
-    // A travel URL + foreign country is the stable page state for this repair pass.
+    // A travel URL + foreign country is the stable page state for upload dedupe.
     // Ordinary DOM churn inside that state should not trigger another upload.
     return `${getPageStateUrl()}::${country}::${currentPageToken}`;
   }
